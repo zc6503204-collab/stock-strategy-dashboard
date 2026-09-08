@@ -51,6 +51,9 @@ def test_local_api_rejects_cross_origin_and_private_files(tmp_path,monkeypatch):
     d.start=noop;d.stop=noop
     monkeypatch.setattr(main,'dashboard',d)
     with TestClient(main.app,base_url='http://localhost') as c:
+        page=c.get('/');assert page.status_code==200
+        assert "location.protocol==='file:'" in page.text
+        assert "sha256-vzr6U6Yv8Vz+BRc+9/HgtZvUqecsKaEvnfervwwT014=" in page.headers['content-security-policy']
         r=c.get('/api/state');assert r.status_code==200
         assert 'apiKey' not in r.text
         assert c.get('/.local/vendor/gtht/gtht-skill-shared/gtht-entry.json').status_code==404

@@ -33,7 +33,7 @@ async def local_only(request:Request,call_next):
     response=await call_next(request)
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['Cache-Control']='no-store'
-    response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+    response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self' 'sha256-vzr6U6Yv8Vz+BRc+9/HgtZvUqecsKaEvnfervwwT014='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
     return response
 
 @app.get('/')
