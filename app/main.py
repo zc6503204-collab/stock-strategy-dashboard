@@ -181,6 +181,11 @@ async def strategy_recommendations(strategy:str,market:str='CN'):
     if strategy not in dashboard.registry.revisions.get(market,{}):raise HTTPException(400,'未知策略或市场')
     return dashboard.strategy_recommendations(market).get(strategy)
 
+@app.get('/api/strategies/{strategy}/performance')
+async def strategy_performance(strategy:str,market:str='CN',version:str|None=None):
+    try:return dashboard.strategy_performance_detail(market,strategy,version)
+    except ValueError as e:raise HTTPException(400,str(e))
+
 class AnalyzeHolding(BaseModel):
     quantity:float|None=Field(default=None,gt=0)
     cost:float|None=Field(default=None,gt=0)

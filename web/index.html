@@ -77,13 +77,14 @@
       <section class="page hidden" id="review">
         <div class="page-title"><div><span class="kicker" id="review-kicker">A股 · 复盘研究</span><h1>只评估当前市场</h1><p>收益均扣除估计成本；样本不足30笔时不宣称策略有效。</p></div><button class="secondary" id="toggle-simulation">暂停模拟新开仓</button></div>
         <div id="review-account"></div>
-        <div class="two-columns"><section class="panel"><div class="panel-head"><div><span class="kicker">策略对比</span><h2>启动突破 vs 首次回调</h2></div></div><div id="strategy-metrics"></div></section><section class="panel"><div class="panel-head"><div><span class="kicker">未成交</span><h2>失败与取消</h2></div></div><div id="market-failures"></div></section></div>
+        <div class="two-columns"><section class="panel"><div class="panel-head"><div><span class="kicker">策略影子模拟</span><h2>逐策略公平比较</h2><p>不受其他策略资金竞争影响；组合账户仍单独统计。</p></div></div><div id="strategy-metrics"></div></section><section class="panel"><div class="panel-head"><div><span class="kicker">未成交</span><h2>失败与取消</h2></div></div><div id="market-failures"></div></section></div>
         <section class="panel"><div class="panel-head"><div><span class="kicker">前向样本</span><h2>已结束交易</h2></div></div><div id="market-trades"></div></section>
         <section class="panel"><div class="panel-head"><div><span class="kicker">候选复核</span><h2>单股历史回放</h2><p>使用本机已有完整K线，前70%预热，后30%按固定规则检查。</p></div></div><div class="inline-form"><select id="replay-symbol"></select><button class="secondary" id="run-replay">开始回放</button></div><div id="replay-result" class="result-box"></div></section>
       </section>
 
       <section class="page hidden" id="strategies">
         <div class="page-title"><div><span class="kicker" id="strategies-kicker">A股 · 策略中心</span><h1>每种策略，独立选股和验证</h1><p>参数修改会立即生成新版本；旧持仓继续沿用入场版本。</p></div><button class="secondary" id="strategy-versions">查看当前策略版本</button></div>
+        <div class="tab-switch strategy-horizon-filter" id="strategy-horizon-filter"><button data-horizon="all" class="selected">全部</button><button data-horizon="intraday">日内</button><button data-horizon="short">短线</button><button data-horizon="swing">波段</button></div>
         <div class="strategy-card-grid" id="strategy-cards"></div>
         <section class="panel strategy-workbench" id="strategy-workbench"></section>
       </section>
@@ -96,7 +97,7 @@
             <details><summary>结合我的真实买入情况（可选）</summary><div class="form-grid analyze-holding"><label>持仓数量<input id="analyze-quantity" type="number" min="0.0001" step="any"></label><label>买入均价<input id="analyze-cost" type="number" min="0.0001" step="any"></label><label>买入日期<input id="analyze-date" type="date"></label><label>当前可卖数量<input id="analyze-available" type="number" min="0" step="any"></label><label>保护价<input id="analyze-stop" type="number" min="0.0001" step="any"></label><label>止盈参考<input id="analyze-target" type="number" min="0.0001" step="any"></label></div></details>
           </form>
         </section>
-        <div id="analyze-result"><div class="empty-primary"><div><div class="empty-icon">◎</div><h2>等待输入股票</h2><p>系统会读取同一来源的日线、五分钟K线、最新报价和盘口，再分别运行四种策略。</p></div></div></div>
+        <div id="analyze-result"><div class="empty-primary"><div><div class="empty-icon">◎</div><h2>等待输入股票</h2><p>系统会读取同一来源的日线、五分钟K线、最新报价和盘口，再运行当前市场适用的全部策略。</p></div></div></div>
       </section>
 
       <section class="page hidden" id="strategy">

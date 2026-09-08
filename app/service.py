@@ -6,7 +6,7 @@ from .providers import ROOT,Lingxi,Longbridge,IBKR,number,canonical
 from .calendars import is_open,local_date,adjacent,price_limits,phase
 from .strategy import Strategies
 from .research import ResearchEngine,VERSION,BENCHMARKS,daily_factors
-from .decisions import recommend,holding_plan,fresh_quote
+from .decisions import recommend,shadow_recommend,holding_plan,fresh_quote
 from .alerts import Alerts
 from .calendars import calendar,monitoring_window,close_time
 from .simulation import Simulation
@@ -14,6 +14,9 @@ from .store import Store
 from .selection import evaluate as evaluate_selection,candidate_pool
 from .holdings import RealHoldings,real_holding_plan
 from .strategy_registry import StrategyRegistry,DEFINITIONS
+
+DAILY_FETCH_COUNT=270
+DAILY_CACHE_MIN=260
 
 def _atr_pct(bars):
     if len(bars)<21 or not bars[-1].close:return 999.
@@ -257,10 +260,10 @@ class Dashboard:
                     if not self.allowed_security(row):raise ValueError('不在选股范围')
                     key='selection_daily:'+row['symbol']
                     cached=self.store.get(key)
-                    if cached and cached.get('fetched_date')==str(local_date(now(),symbol_market(row['symbol']))) and len(cached.get('bars',[]))>=125:
+                    if cached and cached.get('fetched_date')==str(local_date(now(),symbol_market(row['symbol']))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
                         daily=[Bar.load(b) for b in cached['bars']]
                     else:
-                        daily=await self.lb.bars(row['symbol'],'day',130)
+                        daily=await self.lb.bars(row['symbol'],'day',DAILY_FETCH_COUNT)
                         daily=[b for b in daily if local_date(b.start,symbol_market(row['symbol']))<local_date(now(),symbol_market(row['symbol']))]
                         self.store.set(key,{'fetched_date':str(local_date(now(),symbol_market(row['symbol']))),'bars':[b.dump() for b in daily]})
                     if reference and reference.get('total_shares') and daily:row['market_cap']=daily[-1].close*reference['total_shares']
@@ -280,6 +283,13 @@ class Dashboard:
                 self.selection=sorted(visible,key=lambda r:({'重点观察':0,'等确认':1,'暂不参与':2}[r['decision']],-r['score'],abs(r['distance_to_high_pct'])))
                 self.broadcast()
                 await asyncio.sleep(.1)
+            for market in ['CN','US']:
+                ranked=sorted([r for r in results if r.get('market')==market and r.get('relative_strength') is not None],key=lambda r:r['relative_strength'])
+                coverage=len(ranked)
+                for index,item in enumerate(ranked):
+                    item['rs_percentile']=100. if coverage==1 else round(index/(coverage-1)*100,1)
+                    item['rs_rank_coverage']=coverage
+                    self.strategies.set_relative_rank(item['symbol'],item['rs_percentile'],coverage)
             self.selection=sorted(results,key=lambda r:({'重点观察':0,'等确认':1,'暂不参与':2}[r['decision']],-r['score'],abs(r['distance_to_high_pct'])))
             self.store.set('selection',self.selection);self.store.set('selection_updated',now().isoformat())
             by_symbol={r['symbol']:r for r in rows}
@@ -409,10 +419,10 @@ class Dashboard:
                     if v.get('daily_checked')!=str(local_date(now(),symbol_market(symbol))):
                         cache_key='selection_daily:'+symbol
                         cached=self.store.get(cache_key,{})
-                        if cached.get('fetched_date')==str(local_date(now(),symbol_market(symbol))) and len(cached.get('bars',[]))>=125:
+                        if cached.get('fetched_date')==str(local_date(now(),symbol_market(symbol))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
                             days=[Bar.load(b) for b in cached['bars']]
                         else:
-                            days=await self.lb.bars(symbol,'day',130)
+                            days=await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT)
                             self.store.set(cache_key,{'fetched_date':str(local_date(now(),symbol_market(symbol))),'bars':[b.dump() for b in days]})
                         completed=[b for b in days if local_date(b.start,symbol_market(symbol))<local_date(now(),symbol_market(symbol))]
                         if len(completed)<21:raise ValueError('不足21个完整交易日，暂不产生交易信号')
@@ -513,7 +523,7 @@ class Dashboard:
         real_symbols=self.real.symbols();tracked=set(self.tracked())
         alerts=self.alerts.list(30);simulation=self.sim.summary()
         workspaces={m:self.market_workspace(m,rows,simulation,alerts) for m in ['CN','US']}
-        return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 3.0','settings':self.settings,
+        return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 4.0','settings':self.settings,
                 'decisions':self.decisions,'exit_plans':self.exit_plans,'real_holdings':self.real.list(),'real_plans':self.real_plans,
                 'holding_sync':self.holding_sync,'premarket':{m:self.premarket(m) for m in ['CN','US']},'alerts':alerts,
                 'notification_settings':self.alerts.status(),'monitor':{'running':self.monitor_running,'last_ok':self.runtime_ok,'ai_calls':0,'research':self.research_progress,
@@ -533,10 +543,22 @@ class Dashboard:
 
     def strategy_performance(self,market):
         result={}
-        for strategy in DEFINITIONS:
+        for strategy,definition in DEFINITIONS.items():
+            if market not in definition['markets']:continue
             version=self.registry.current(strategy,market)['version']
-            result[strategy]=self.sim.summary(version)[market]['strategies'][strategy]
+            result[strategy]=self.sim.performance(market,strategy,version)
         return result
+
+    def strategy_performance_detail(self,market,strategy,version=None):
+        if strategy not in DEFINITIONS or market not in DEFINITIONS[strategy]['markets']:raise ValueError('未知策略或市场')
+        revision=self.registry.current(strategy,market) if version is None else next((r for r in self.registry.revisions[market][strategy] if r['version']==version),None)
+        if not revision:raise ValueError('找不到策略版本')
+        performance=self.sim.performance(market,strategy,revision['version'])
+        return {'market':market,'strategy':strategy,'name':DEFINITIONS[strategy]['name'],'version':revision['version'],
+                'horizon':DEFINITIONS[strategy]['horizon'],'forward_shadow':performance['shadow'],
+                'portfolio':performance['portfolio'],'historical':revision.get('replay') or {
+                    'state':'insufficient_data','label':'历史探索结果','message':'本地逐时点历史尚不完整，未生成收益结果'},
+                'interpretation':'前向影子模拟评价策略本身；组合模拟包含资金与仓位竞争。'}
 
     def strategy_recommendations(self,market,rows=None,decisions=None,premarket=None,simulation=None):
         rows=rows or {r['symbol']:dict(r) for r in self.candidates}
@@ -544,6 +566,7 @@ class Dashboard:
         premarket=premarket if premarket is not None else self.premarket(market)
         output={}
         for strategy,definition in DEFINITIONS.items():
+            if market not in definition['markets']:continue
             if not self.registry.enabled(strategy,market):
                 output[strategy]={'strategy':strategy,'name':definition['name'],'enabled':False,
                                   'version':self.registry.current(strategy,market)['version'],
@@ -575,9 +598,29 @@ class Dashboard:
                                        '靠近20日高点':abs(setup.get('distance_to_high_pct') or 999)<=config['near_high_pct']})
                     score+=(12 if conditions['波动收缩'] else -15)+(8 if conditions['靠近20日高点'] else -10)
                     trigger=setup.get('high10');reason='等待ATR收缩并放量突破整理区'
+                elif strategy=='trend_rsi_pullback':
+                    rsi=setup.get('rsi14');contraction=setup.get('volume_contraction')
+                    conditions.update({'MA20高于MA60':bool(setup.get('ma20') and setup.get('ma20')>setup.get('ma60',float('inf')) and setup.get('close',0)>setup.get('ma60',float('inf'))),
+                                       '近期RSI强势':setup.get('rsi_recent_peak') is not None and setup['rsi_recent_peak']>=config['rsi_peak_min'],
+                                       '靠近MA20':abs((setup.get('close') or 0)/(setup.get('ma20') or 1)-1)*100<=config['ma_distance_pct'],
+                                       'RSI回落区间':rsi is not None and config['rsi_current_min']<=rsi<=config['rsi_current_max'],
+                                       '缩量回踩':contraction is not None and contraction<=config['volume_contraction_max']})
+                    score+=sum(6 if ok else -8 for ok in list(conditions.values())[-5:])
+                    trigger=setup.get('ma20');reason='等待RSI强势回落后在VWAP或EMA附近重新转强'
+                elif strategy=='vcp_swing':
+                    percentile=setup.get('rs_percentile');contraction=setup.get('atr_contraction');range_ratio=setup.get('range_contraction')
+                    conditions.update({'EMA多头':bool(setup.get('ema10') and setup.get('ema10')>setup.get('ema20',float('inf'))>setup.get('ema50',float('inf'))),
+                                       '相对强势前列':percentile is not None and percentile>=100-config['rs_top_pct'],
+                                       '高低点抬升':bool(setup.get('higher_high_low')),
+                                       '波动收缩':contraction is not None and contraction<=config['contraction_max'] and range_ratio is not None and range_ratio<=config['range_contraction_max']})
+                    score+=sum(8 if ok else -10 for ok in list(conditions.values())[-4:])
+                    trigger=setup.get('high10');reason='等待VCP质量、排名与收缩条件完成后放量突破'
+                elif strategy=='orb20_us':
+                    reason='等待美股10:00至11:30突破20分钟开盘区间';trigger=setup.get('breakout_reference')
                 score=max(0,min(100,round(score,1)))
                 items.append({'symbol':setup['symbol'],'name':setup.get('name',setup['symbol']),'strategy':strategy,
                               'strategy_name':definition['name'],'version':self.registry.current(strategy,market)['version'],
+                              'horizon':definition['horizon'],'max_hold_sessions':definition['max_hold_sessions'],'exit_policy':definition['exit_policy'],
                               'state':'watch','slot':'watch','action':'观察备选','score':score,'reason':reason,
                               'trigger':trigger,'stop':setup.get('structure_low'),'risk_group':setup.get('risk_group','pending'),
                               'source':setup.get('source'),'as_of':setup.get('as_of'),'conditions':conditions,
@@ -630,14 +673,15 @@ class Dashboard:
             for symbol in symbols:
                 daily=len(self.store.get('selection_daily:'+symbol,{}).get('bars',[]))
                 history=sum(bool(self.store.get(f'research_bars:{symbol}:{session.date()}')) for session in sessions)
-                ready=daily>=65 and history>=14 and benchmark>=65
+                needed=self.analysis_daily_required(strategy,self.registry.config(strategy,market))
+                ready=daily>=needed and history>=14 and benchmark>=61
                 complete+=int(ready);details.append({'symbol':symbol,'daily_bars':daily,'intraday_sessions':history,'ready':ready})
             message=(f'已有{complete}只股票具备完整逐时点历史，尚需同源基准盘中历史后再运行'
                      if complete else '本地逐时点历史尚不完整；为避免未来数据泄漏，暂不生成回放收益')
             self.registry.set_replay(strategy,market,version,{
                 'state':'insufficient_data','label':'历史探索结果','message':message,
                 'checked_at':now().isoformat(),'symbols_checked':len(symbols),'complete_symbols':complete,
-                'requirements':{'daily_bars':65,'prior_intraday_sessions':14,'same_source_benchmark':True},
+                'requirements':{'daily_bars':self.analysis_daily_required(strategy,self.registry.config(strategy,market)),'prior_intraday_sessions':14,'same_source_benchmark':True},
                 'details':details})
             self.broadcast()
         try:
@@ -659,6 +703,8 @@ class Dashboard:
     @staticmethod
     def analysis_daily_required(strategy,config):
         if strategy=='trend_pullback':return max(25,int(config['daily_slow'])+5)
+        if strategy=='trend_rsi_pullback':return max(65,int(config['daily_slow'])+5,int(config['rsi_period'])+7)
+        if strategy=='vcp_swing':return 260
         if strategy=='volatility_breakout':return max(25,int(config['atr_long'])+1,int(config['breakout_days']))
         return max(25,int(config.get('daily_ma',20))+5)
 
@@ -712,10 +758,12 @@ class Dashboard:
         # parallel and keep an honest WAIT result when a provider is slow.
         if self.lb.ctx:
             jobs={}
-            if len(daily)<25:jobs['daily']=asyncio.create_task(asyncio.wait_for(self.lb.bars(symbol,'day',130),8))
+            applicable=[k for k,d in DEFINITIONS.items() if market in d['markets']]
+            daily_needed=max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in applicable)
+            if len(daily)<daily_needed:jobs['daily']=asyncio.create_task(asyncio.wait_for(self.lb.bars(symbol,'day',DAILY_FETCH_COUNT),8))
             stale_bar=is_open(now(),market) and (not current_bars or (now()-current_bars[-1].end).total_seconds()>390)
             if len(current_bars)<2 or stale_bar:jobs['intraday']=asyncio.create_task(asyncio.wait_for(self.lb.bars(symbol,'5m',1000),8))
-            if len(benchmark_daily)<21:jobs['benchmark_daily']=asyncio.create_task(asyncio.wait_for(self.lb.bars(BENCHMARKS[market],'day',130),8))
+            if len(benchmark_daily)<61:jobs['benchmark_daily']=asyncio.create_task(asyncio.wait_for(self.lb.bars(BENCHMARKS[market],'day',DAILY_FETCH_COUNT),8))
             if not benchmark_intraday:jobs['benchmark_intraday']=asyncio.create_task(asyncio.wait_for(self.lb.bars(BENCHMARKS[market],'5m',1000),8))
             if not candidate.get('name'):jobs['reference']=asyncio.create_task(asyncio.wait_for(self.lb.reference_info([symbol]),5))
             if not quote or (now()-quote.received_at).total_seconds()>30:
@@ -747,6 +795,8 @@ class Dashboard:
                 if supplemental:quote=supplemental[0]
             except Exception:fetch_errors.append('supplemental_quote')
         name=references.get(symbol,{}).get('name') or candidate.get('name') or self.security_map.get(symbol,{}).get('name') or symbol
+        if cached and len(daily)>len(self.strategies.context[symbol].get('daily_bars',[])):
+            cached=False
         if cached:
             context=self.strategies.context[symbol];daily=context.get('daily_bars',[]);benchmark_daily=context.get('benchmark_daily',[])
             intraday=self.strategies.history[symbol];benchmark_intraday=self.strategies.benchmarks.get(market,[])
@@ -756,7 +806,9 @@ class Dashboard:
         else:
             intraday=sorted(current_bars,key=lambda b:b.start);signals=[];preview={}
             if daily and benchmark_daily:
-                engine=ResearchEngine(self.registry);engine.prepare(symbol,daily,historical,benchmark_daily);engine.set_benchmark(market,benchmark_intraday)
+                setup=next((r for r in self.selection if r['symbol']==symbol),{})
+                rank={'percentile':setup.get('rs_percentile'),'coverage':setup.get('rs_rank_coverage',0)}
+                engine=ResearchEngine(self.registry);engine.prepare(symbol,daily,historical,benchmark_daily,rank);engine.set_benchmark(market,benchmark_intraday)
                 risk_group='st' if self.is_st(symbol,name) else 'smallcap' if (_atr_pct(daily)>=5) else 'normal'
                 for bar in intraday:signals.extend(engine.update(bar,risk_group))
                 preview=engine.preview(symbol).get('strategies',{})
@@ -824,6 +876,11 @@ class Dashboard:
                             self.sim.state,observed_at,temporary,self.registry.active_versions())
         per_strategy=[]
         for strategy,definition in DEFINITIONS.items():
+            if market not in definition['markets']:
+                per_strategy.append({'strategy':strategy,'name':definition['name'],'version':None,'state':'不适用',
+                                     'reason':'该策略仅适用于'+('／'.join(definition['markets'])),'conditions':{},'requirements':{},'decision':None,'enabled':False,
+                                     'horizon':definition['horizon'],'max_hold_sessions':definition['max_hold_sessions']})
+                continue
             config=self.registry.config(strategy,market)
             required_daily=self.analysis_daily_required(strategy,config)
             if strategy=='trend_pullback':
@@ -832,9 +889,17 @@ class Dashboard:
             elif strategy=='volatility_breakout':
                 strategy_daily=daily_factors(symbol,daily,benchmark_daily,config['daily_ma'],None,config['liquidity_min'],config['relative_strength_min'])
                 required_intraday=2
-            else:
+            elif strategy=='vcp_swing':
+                strategy_daily=preview.get(strategy,{}) or {'eligible':False,'reason':'等待VCP完整数据'}
+                required_intraday=2
+            elif strategy=='trend_rsi_pullback':
+                strategy_daily=preview.get(strategy,{}) or daily_factors(symbol,daily,benchmark_daily,config['daily_fast'],config['daily_slow'],config['liquidity_min'],config['relative_strength_min'])
+                required_intraday=int(config['intraday_ema'])+1
+            elif strategy in ('breakout','pullback'):
                 strategy_daily=factors;required_intraday=int(config['opening_bars'])+1
-            needs_baseline=strategy in ('breakout','pullback','volatility_breakout')
+            else:
+                strategy_daily=factors;required_intraday=int(config['opening_minutes'])//5+1
+            needs_baseline=strategy in ('breakout','pullback','volatility_breakout','vcp_swing','orb20_us')
             requirements={'日线数据':len(daily)>=required_daily,
                           '今日完整5分钟K线':len(today_bars)>=required_intraday,
                           '最新完整K线':bars_timely,
@@ -856,7 +921,8 @@ class Dashboard:
             per_strategy.append({'strategy':strategy,'name':definition['name'],'version':self.registry.current(strategy,market)['version'],
                                  'state':state,'reason':decision.get('reason') if decision else view.get('reason'),
                                  'conditions':view,'requirements':requirements,'decision':decision,
-                                 'enabled':self.registry.enabled(strategy,market)})
+                                 'enabled':self.registry.enabled(strategy,market),'horizon':definition['horizon'],
+                                 'max_hold_sessions':definition['max_hold_sessions'],'exit_policy':definition['exit_policy']})
         entered=next((p for p in temporary if p['symbol']==symbol and p.get('quantity',0)>0),None)
         holding_plan_row=real_holding_plan(entered,quote,observed_at,validation) if entered else None
         buy=next((r for r in decisions if r.get('state')=='buy'),None)
@@ -875,7 +941,8 @@ class Dashboard:
             final={'status':'WAIT','action':'继续等待',
                    'reason':reasons[0] if reasons else validation['reason']}
         transport,transport_label=self.analysis_transport(symbol)
-        research_full=(len(daily)>=max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in DEFINITIONS)
+        applicable=[k for k,d in DEFINITIONS.items() if market in d['markets']]
+        research_full=(len(daily)>=max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in applicable)
                        and len(benchmark_daily)>=21 and len(today_bars)>=2 and benchmark_synced and baseline_sessions>=14)
         if not daily and not today_bars and not quote:data_status='unavailable'
         elif open_now and (not bars_timely or (quote and not quote_timely)):data_status='stale'
@@ -884,7 +951,8 @@ class Dashboard:
         elif symbol in self.tracked():data_status='warming'
         else:data_status='partial'
         blocked=[]
-        if len(daily)<25:blocked.append(f'日线数据 {len(daily)}/25')
+        if len(daily)<max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in applicable):
+            blocked.append(f"完整策略日线 {len(daily)}/{max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in applicable)}")
         if len(benchmark_daily)<21:blocked.append(f'基准日线 {len(benchmark_daily)}/21')
         if len(today_bars)<2:blocked.append(f'今日完整5分钟K线 {len(today_bars)}/2')
         elif open_now and not bars_timely:blocked.append(f'最新完整5分钟K线已延迟 {round(bar_age/60,1) if bar_age is not None else "—"}分钟')
@@ -905,7 +973,7 @@ class Dashboard:
                    'relative_strength':factors.get('relative_strength'),'average_turnover':factors.get('average_turnover'),
                    'atr_pct':_atr_pct(daily) if len(daily)>=21 else None,'trend':factors.get('trend')}
         next_confirmation=(today_bars[-1].end+timedelta(minutes=5)).isoformat() if open_now and bars_timely else None
-        profile={'daily':{'count':len(daily),'required':25,'start':daily[0].start.isoformat() if daily else None,
+        profile={'daily':{'count':len(daily),'required':max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in applicable),'start':daily[0].start.isoformat() if daily else None,
                           'end':daily[-1].start.isoformat() if daily else None},
                  'intraday':{'count':len(today_bars),'last_bar_at':today_bars[-1].end.isoformat() if today_bars else None,
                              'age_seconds':round(bar_age,1) if bar_age is not None else None,'timely':bars_timely},
@@ -1006,6 +1074,11 @@ class Dashboard:
         if open_now and fresh<len(tracked):issues.append('部分报价超过30秒')
         if not self.monitor_running:issues.append('后台盯盘已暂停')
         recommendations=self.strategy_recommendations(market,rows,decisions,premarket,simulation)
+        catalog=self.registry.list(market,self.strategy_performance(market))
+        strategy_groups={h:{'strategies':[r for r in catalog if r['horizon']==h],
+                            'recommendations':{k:v for k,v in recommendations.items() if DEFINITIONS[k]['horizon']==h},
+                            'portfolio_performance':simulation[market].get('by_horizon',{}).get(h,{})}
+                         for h in ['intraday','short','swing']}
         if primary:primary['matched_strategies']=primary.get('strategies',[primary.get('strategy')])
         for row in backups:row['matched_strategies']=row.get('strategies',[row.get('strategy')])
         return {
@@ -1025,11 +1098,10 @@ class Dashboard:
                         'reason':'有持仓退出条件需要先处理' if urgent else '买点已通过完整K线、现价、盘口与资金检查' if primary else '尚无股票同时通过盘中触发、实时行情、盘口和风险检查'},
             'premarket':premarket,'candidates':candidates,
             'holdings':{'real':real,'paper':paper,'actionable':actionable[:6]},
-            'alerts':market_alerts,'simulation':simulation[market],
+            'alerts':market_alerts,'simulation':dict(simulation[market],shadow=self.sim.shadow_summary(market).get(market,{})),
             'breadth':dict(self.market_stats,as_of=self.market_stats_time,available=True) if market=='CN' else {'available':False,'message':'美股市场广度尚未接入'},
             'sources':{'primary':'longbridge','supplemental':'lingxi' if market=='CN' else 'ibkr'},
-            'strategies':self.registry.list(market,self.strategy_performance(market)),
-            'strategy_recommendations':recommendations,
+            'strategies':catalog,'strategy_recommendations':recommendations,'strategy_groups':strategy_groups,
         }
 
     def replay(self,symbol,source,strategy=None):
@@ -1082,10 +1154,12 @@ class Dashboard:
         markets=[m for m in ['CN','US'] if monitoring_window(now(),m)]
         if not markets:return
         held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
-        pending=[s['symbol'] for s in self.sim.state['pending'].values()]
+        pending=[s['symbol'] for s in list(self.sim.state['pending'].values())+list(self.sim.state['shadow']['pending'].values())]
         picks=[r['symbol'] for r in self.selection if r.get('market') in markets and r['decision']=='重点观察']
+        swing=[r['symbol'] for r in sorted(self.selection,key=lambda r:(-(r.get('rs_percentile') or 0),r.get('atr_contraction') or 999,r['symbol']))
+               if r.get('market') in markets and r.get('decision')!='暂不参与' and r.get('atr_contraction') is not None]
         fallback=[r['symbol'] for r in self.selection if r.get('market') in markets and r['decision']!='暂不参与']
-        desired=list(dict.fromkeys(self.real.symbols()+held+pending+self.manual_watch+picks+fallback+[s for s in self.watch if symbol_market(s) in markets]))[:self.settings['monitor_limit']]
+        desired=list(dict.fromkeys(self.real.symbols()+held+pending+self.manual_watch+picks+swing+fallback+[s for s in self.watch if symbol_market(s) in markets]))[:self.settings['monitor_limit']]
         if desired and desired!=self.watch:
             self.watch=desired;self.store.set('watch',desired);self.first_poll=True
 
@@ -1144,6 +1218,8 @@ class Dashboard:
             if type(self.strategies) is Strategies and signal.version=='实验 1.0.0' and self.store.signal(signal) and self.settings['simulation_enabled']:
                 self.sim.queue(signal)
             return
+        performance=self.sim.performance(market,signal.strategy,signal.version)
+        signal.evidence={**signal.evidence,'forward_quality':min(1.,performance.get('count',0)/100)}
         self.store.signal(signal)
 
     def evaluate_decisions(self):
@@ -1156,7 +1232,15 @@ class Dashboard:
         for p in real_rows:
             p['risk_group']=self.validation.get(p['symbol'],{}).get('risk_group',p.get('risk_group','pending'))
             names[p['symbol']]=p.get('name') or names.get(p['symbol'],p['symbol'])
-        result=recommend(raws,self.quotes,self.validation,state,t,real_rows,self.registry.active_versions()) if self.monitor_running else []
+        active=self.registry.active_versions()
+        result=recommend(raws,self.quotes,self.validation,state,t,real_rows,active) if self.monitor_running else []
+        shadow_rows=shadow_recommend(raws,self.quotes,self.validation,state,t,active) if self.monitor_running else []
+        for row in shadow_rows:
+            if row['state']!='buy' or row['signal_id'] in self.sim.state['shadow']['pending']:continue
+            raw=next(x for x in raws if x['id']==row['signal_id']);signal=Signal.load(raw)
+            signal.evidence={**signal.evidence,'approval':{'time':t.isoformat(),'price':row['price'],'qty':row['qty'],
+                'planned_risk':row['planned_risk'],'cash_required':row['cash_required'],'quote_time':row['quote_time'],'depth_time':row['depth_time']}}
+            self.sim.queue_shadow(signal)
         for r in result:
             r['name']=names.get(r['symbol'],r['symbol'])
             if r['signal_id'] in self.sim.state['pending']:
@@ -1167,7 +1251,7 @@ class Dashboard:
                 if self.settings['simulation_enabled']:
                     raw=next(x for x in raws if x['id']==r['signal_id']);signal=Signal.load(raw)
                     signal.evidence={**signal.evidence,'approval':{'time':t.isoformat(),'price':r['price'],'qty':r['qty'],'cash_required':r['cash_required'],
-                                        'quote_time':r['quote_time'],'depth_time':r['depth_time']}}
+                                        'planned_risk':r['planned_risk'],'quote_time':r['quote_time'],'depth_time':r['depth_time']}}
                     self.sim.queue(signal)
         old={r['signal_id']:r for r in self.decisions}
         new={r['signal_id']:r for r in result}
@@ -1282,8 +1366,8 @@ class Dashboard:
             cached=self.store.get(key)
             if not cached:
                 try:
-                    bars=[b for b in await self.lb.bars(symbol,'day',130) if local_date(b.start,market)<day]
-                    if len(bars)<25:continue
+                    bars=[b for b in await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT) if local_date(b.start,market)<day]
+                    if len(bars)<61:continue
                     cached=[b.dump() for b in bars];self.store.set(key,cached)
                 except Exception:
                     self.research_progress[market]={'state':'waiting','reason':'基准日线暂不可用'};continue
@@ -1297,9 +1381,9 @@ class Dashboard:
                 refs=await self.lb.reference_info([symbol]);meta=self.candidate(symbol)
                 if symbol in refs:meta.update(name=refs[symbol]['name'])
                 cached=self.store.get('selection_daily:'+symbol,{})
-                daily=[Bar.load(b) for b in cached.get('bars',[])] if cached.get('fetched_date')==str(day) and len(cached.get('bars',[]))>=125 else []
+                daily=[Bar.load(b) for b in cached.get('bars',[])] if cached.get('fetched_date')==str(day) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN else []
                 if not daily:
-                    daily=[b for b in await self.lb.bars(symbol,'day',130) if local_date(b.start,market)<day]
+                    daily=[b for b in await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT) if local_date(b.start,market)<day]
                     self.store.set('selection_daily:'+symbol,{'fetched_date':str(day),'bars':[b.dump() for b in daily]})
                 if symbol in refs and refs[symbol].get('total_shares') and daily:
                     meta['market_cap']=refs[symbol]['total_shares']*daily[-1].close
@@ -1327,11 +1411,15 @@ class Dashboard:
                     history.extend(Bar.load(b) for b in saved);days+=1
                     self.research_progress[symbol].update(days=days)
                 self.broadcast()
-                self.strategies.prepare(symbol,daily,history,self.benchmark_daily[market])
+                setup=next((r for r in self.selection if r['symbol']==symbol),{})
+                rank={'percentile':setup.get('rs_percentile'),'coverage':setup.get('rs_rank_coverage',0)}
+                self.strategies.prepare(symbol,daily,history,self.benchmark_daily[market],rank)
                 self.research_ready[symbol]=str(day)
                 f=self.strategies.context[symbol]['daily']
-                self.research_progress[symbol]={'state':'ready' if days==14 and f.get('eligible') else 'filtered' if not f.get('eligible') else 'waiting','days':days,'required':14,
-                    'reason':f['reason'] if days==14 else '最近历史不足14日；已缓存，后续交易日自动补齐'}
+                daily_need=max(self.analysis_daily_required(k,self.registry.config(k,market)) for k,d in DEFINITIONS.items() if market in d['markets'])
+                self.research_progress[symbol]={'state':'ready' if days==14 and len(daily)>=daily_need and f.get('eligible') else 'filtered' if not f.get('eligible') else 'waiting','days':days,'required':14,
+                    'daily_bars':len(daily),'daily_required':daily_need,
+                    'reason':f['reason'] if days==14 and len(daily)>=daily_need else f'日线预热 {len(daily)}/{daily_need}' if len(daily)<daily_need else '最近历史不足14日；已缓存，后续交易日自动补齐'}
                 self.first_poll=True
             except Exception as exc:
                 self.research_progress[symbol]={'state':'waiting','reason':'完整历史或成交量口径待核验','error_type':type(exc).__name__}

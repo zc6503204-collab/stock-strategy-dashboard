@@ -103,8 +103,12 @@ class Signal:
     version: str = VERSION
 
     def dump(self):
-        return {**asdict(self), 'time': self.time.isoformat(), 'no_chase': self.trigger + .25 * (self.trigger-self.stop),
-                'target': self.trigger+2*(self.trigger-self.stop)}
+        fraction=float(self.evidence.get('no_chase_risk_fraction',.25))
+        target=self.evidence.get('target_price',self.trigger+2*(self.trigger-self.stop))
+        return {**asdict(self), 'time': self.time.isoformat(), 'no_chase': self.trigger + fraction * (self.trigger-self.stop),
+                'target': target,'horizon':self.evidence.get('horizon','short'),
+                'max_hold_sessions':self.evidence.get('max_hold_sessions',3),
+                'exit_policy':self.evidence.get('exit_policy',{})}
 
     @classmethod
     def load(cls, d):

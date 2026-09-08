@@ -17,7 +17,8 @@ from app.calendars import calendar,open_time
 
 def test_registry_seeds_all_strategies_per_market_and_validates(tmp_path):
     registry=StrategyRegistry(Store(tmp_path/'registry.db'))
-    assert {r['strategy'] for r in registry.list('CN')}==set(DEFINITIONS)
+    assert {r['strategy'] for r in registry.list('CN')}=={key for key,row in DEFINITIONS.items() if 'CN' in row['markets']}
+    assert {r['strategy'] for r in registry.list('US')}==set(DEFINITIONS)
     with pytest.raises(ValueError,match='慢速均线'):
         registry.save('trend_pullback','CN',{'daily_fast':40,'daily_slow':30})
     with pytest.raises(ValueError,match='未知参数'):
@@ -72,7 +73,8 @@ def test_workspace_exposes_isolated_strategy_catalog_and_recommendations(tmp_pat
         'relative_strength':3,'trend':True,'stacked':True,'ma20':99,'ma60':95,'extension_atr':1,
         'atr_contraction':.6,'high10':102,'reason':'等待盘中确认'}]
     snapshot=dashboard.snapshot();us=snapshot['workspaces']['US'];cn=snapshot['workspaces']['CN']
-    assert len(us['strategies'])==4 and set(us['strategy_recommendations'])==set(DEFINITIONS)
+    assert len(us['strategies'])==7 and set(us['strategy_recommendations'])==set(DEFINITIONS)
+    assert len(cn['strategies'])==6 and 'orb20_us' not in cn['strategy_recommendations']
     assert us['strategy_recommendations']['trend_pullback']['primary']['symbol']=='AAPL.US'
     assert all(not (row.get('primary') or {}).get('symbol','').endswith('.US') for row in cn['strategy_recommendations'].values())
     dashboard.save_strategy_config('trend_pullback','US',enabled=False)
@@ -87,7 +89,7 @@ def test_strategy_api_save_versions_and_rollback(tmp_path,monkeypatch):
     dashboard.start=noop;dashboard.stop=noop;monkeypatch.setattr(main,'dashboard',dashboard)
     headers={'X-Dashboard-Local':'1'}
     with TestClient(main.app,base_url='http://localhost') as client:
-        assert len(client.get('/api/strategies?market=CN').json())==4
+        assert len(client.get('/api/strategies?market=CN').json())==6
         changed=client.post('/api/strategies/breakout/config',headers=headers,json={'market':'CN','parameters':{'rvol_min':1.9}});assert changed.status_code==200
         versions=client.get('/api/strategies/breakout/versions?market=CN').json();assert len(versions)==2
         restored=client.post('/api/strategies/breakout/rollback',headers=headers,json={'market':'CN','version':versions[-1]['version']})
@@ -174,7 +176,7 @@ def test_single_stock_analysis_uses_cached_data_without_mutating_holdings_or_mon
     dashboard.strategies.history[symbol]=[Bar(symbol,'longbridge',now()-timedelta(minutes=10),127,128,126,127.5,10000,1_000_000)]
     before_watch=list(dashboard.watch);before_holdings=deepcopy(dashboard.real.list())
     result=asyncio.run(dashboard.analyze_stock({'symbol':symbol,'holding':{'quantity':10,'cost':120,'stop':114,'target':132}}))
-    assert result['symbol']==symbol and len(result['strategies'])==4
+    assert result['symbol']==symbol and len(result['strategies'])==7
     assert result['holding_origin']=='temporary' and result['holding']['quantity']==10
     assert dashboard.watch==before_watch and dashboard.real.list()==before_holdings
     assert '不会自动写入' in result['note']
@@ -200,7 +202,8 @@ def test_chinese_name_analysis_returns_cached_partial_evidence_instead_of_no_dat
     result=asyncio.run(dashboard.analyze_stock({'symbol':'有研新材'}))
     assert result['symbol']==symbol and result['name']=='有研新材'
     assert result['data_status']=='partial' and result['data_profile']['daily']['count']==70
-    assert result['technical']['ma20'] is not None and len(result['strategies'])==4
+    assert result['technical']['ma20'] is not None and len(result['strategies'])==7
+    assert next(row for row in result['strategies'] if row['strategy']=='orb20_us')['state']=='不适用'
     assert result['final']['status']=='WAIT' and dashboard.tracked()==[]
 
 
