@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN" data-market="CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>短线观察台 · 双市场工作区</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/?market=CN" aria-label="回到今日决策"><span class="brand-mark">S</span><span><b>SHORTLIST</b><small>短线观察台</small></span></a>
+    <div class="workspace-tag"><i></i><span id="sidebar-market">A股工作区</span></div>
+    <nav aria-label="工作区页面">
+      <button data-view="today" data-label="决策" class="active"><span>◉</span>今日决策</button>
+      <button data-view="premarket" data-label="盘前"><span>▤</span>盘前观察</button>
+      <button data-view="holdings" data-label="持仓"><span>◆</span>持仓管理</button>
+      <button data-view="review" data-label="复盘"><span>◷</span>复盘研究</button>
+      <button data-view="strategies" data-label="策略"><span>⌁</span>策略中心</button>
+      <button data-view="analyze" data-label="分析"><span>◎</span>单股分析</button>
+      <button data-view="strategy" data-label="策略"><span>⌁</span>策略说明</button>
+      <button data-view="system" data-label="系统"><span>⚙</span>系统状态</button>
+    </nav>
+    <div class="sidebar-foot"><span class="live-dot"></span>本机规则盯盘<br><small>不自动下单 · 日常运行不调用AI</small></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div class="market-switch" id="market-switch" aria-label="选择市场">
+        <button data-workspace="CN" class="selected"><span>A</span><b>A股工作区</b><small>人民币 · 沪深300</small></button>
+        <button data-workspace="US"><span>US</span><b>美股工作区</b><small>美元 · SPY</small></button>
+      </div>
+      <div class="market-time"><b id="market-phase">正在连接</b><span id="market-clock">等待本地行情服务</span></div>
+    </header>
+
+    <div class="content">
+      <section class="page" id="today">
+        <div class="page-title">
+          <div><span class="kicker" id="today-kicker">A股 · 今日决策</span><h1 id="today-title">先看结论，再决定是否行动</h1><p id="today-subtitle">只展示当前市场的买入机会和必须处理的持仓。</p></div>
+          <button class="secondary" data-go="premarket">查看盘前名单 →</button>
+        </div>
+        <div class="health-strip" id="health-strip"></div>
+        <section id="decision-hero" class="decision-hero"></section>
+        <div class="decision-layout">
+          <section class="primary-slot" id="primary-decision"></section>
+          <aside class="backup-column"><div class="section-label"><b>备选位置</b><span>最多2只</span></div><div id="backup-decisions"></div></aside>
+        </div>
+        <div class="lower-grid">
+          <section class="panel"><div class="panel-head"><div><span class="kicker">真实持仓</span><h2>需要立即处理</h2></div><button class="text-button" data-go="holdings">全部持仓 →</button></div><div id="holding-actions"></div></section>
+          <section class="panel"><div class="panel-head"><div><span class="kicker">等待条件</span><h2>现在为什么不买</h2></div></div><div id="waiting-reasons"></div></section>
+        </div>
+        <section class="panel alerts-panel"><div class="panel-head"><div><span class="kicker">本地提醒</span><h2>最近触发</h2></div></div><div id="market-alerts"></div></section>
+      </section>
+
+      <section class="page hidden" id="premarket">
+        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>准备度用于安排观察顺序；只有完整5分钟买点和实时执行检查全部通过后，才会进入今日决策。</p></div><button class="primary" id="refresh-premarket">更新盘前筛选</button></div>
+        <div class="health-strip compact" id="premarket-summary"></div>
+        <div class="screener-layout">
+          <section class="panel screener-panel">
+            <div class="screener-tools"><div class="search-box">⌕<input id="premarket-search" placeholder="搜索股票或代码" autocomplete="off"></div><div class="chips" id="risk-filter"><button data-risk="all" class="selected">全部</button><button data-risk="normal">普通股</button><button data-risk="smallcap">高波动</button><button data-risk="st">ST / *ST</button></div><span id="premarket-count"></span></div>
+            <div class="table-wrap"><table class="screener-table"><thead><tr><th>排名 / 股票</th><th>准备度</th><th>日线收盘</th><th>突破观察位</th><th>保护参考</th><th>成交额</th><th>距高点</th><th>风险</th><th>等待条件</th></tr></thead><tbody id="premarket-rows"></tbody></table></div>
+          </section>
+          <aside class="panel stock-detail" id="stock-detail"></aside>
+        </div>
+        <section class="panel breadth-panel"><div class="panel-head"><div><span class="kicker">市场背景</span><h2 id="breadth-title">A股市场广度</h2></div></div><div id="market-breadth"></div></section>
+        <section class="panel" id="lingxi-panel"><div class="panel-head"><div><span class="kicker">A股补充筛选</span><h2>用一句话查询灵犀</h2><p>查询结果只补充候选，仍需通过本地日线与盘中规则。</p></div></div><form id="screen-form" class="inline-form"><input id="screen-query" required minlength="2" maxlength="300" placeholder="例如：筛选主板和创业板中成交活跃、接近20日新高的股票"><button class="secondary">查询</button></form><div id="screen-result" class="result-box"></div></section>
+      </section>
+
+      <section class="page hidden" id="holdings">
+        <div class="page-title"><div><span class="kicker" id="holdings-kicker">A股 · 持仓管理</span><h1>持仓和退出计划</h1><p>真实持仓与模拟持仓分开显示；所有真实交易仍由你自行决定和下单。</p></div><div class="title-actions"><button class="secondary" id="sync-holdings">同步券商持仓</button><button class="primary" id="add-holding">＋ 手工录入</button></div></div>
+        <div class="health-strip compact" id="holding-summary"></div>
+        <div class="tab-switch" id="holding-kind"><button data-holding-kind="real" class="selected">真实持仓</button><button data-holding-kind="paper">模拟持仓</button></div>
+        <section class="panel"><div class="table-wrap" id="holdings-content"></div></section>
+      </section>
+
+      <section class="page hidden" id="review">
+        <div class="page-title"><div><span class="kicker" id="review-kicker">A股 · 复盘研究</span><h1>只评估当前市场</h1><p>收益均扣除估计成本；样本不足30笔时不宣称策略有效。</p></div><button class="secondary" id="toggle-simulation">暂停模拟新开仓</button></div>
+        <div id="review-account"></div>
+        <div class="two-columns"><section class="panel"><div class="panel-head"><div><span class="kicker">策略对比</span><h2>启动突破 vs 首次回调</h2></div></div><div id="strategy-metrics"></div></section><section class="panel"><div class="panel-head"><div><span class="kicker">未成交</span><h2>失败与取消</h2></div></div><div id="market-failures"></div></section></div>
+        <section class="panel"><div class="panel-head"><div><span class="kicker">前向样本</span><h2>已结束交易</h2></div></div><div id="market-trades"></div></section>
+        <section class="panel"><div class="panel-head"><div><span class="kicker">候选复核</span><h2>单股历史回放</h2><p>使用本机已有完整K线，前70%预热，后30%按固定规则检查。</p></div></div><div class="inline-form"><select id="replay-symbol"></select><button class="secondary" id="run-replay">开始回放</button></div><div id="replay-result" class="result-box"></div></section>
+      </section>
+
+      <section class="page hidden" id="strategies">
+        <div class="page-title"><div><span class="kicker" id="strategies-kicker">A股 · 策略中心</span><h1>每种策略，独立选股和验证</h1><p>参数修改会立即生成新版本；旧持仓继续沿用入场版本。</p></div><button class="secondary" id="strategy-versions">查看当前策略版本</button></div>
+        <div class="strategy-card-grid" id="strategy-cards"></div>
+        <section class="panel strategy-workbench" id="strategy-workbench"></section>
+      </section>
+
+      <section class="page hidden" id="analyze">
+        <div class="page-title"><div><span class="kicker" id="analyze-kicker">A股 · 单股分析</span><h1>输入一只股票，逐策略判断</h1><p>临时分析不写入持仓，也不占用持续监测名额。</p></div></div>
+        <section class="panel analyze-entry">
+          <form id="analyze-form">
+            <div class="analyze-symbol"><label>股票代码或名称<input id="analyze-symbol" list="analyze-suggestions" required maxlength="20" placeholder="600519.SH / AAPL.US" autocomplete="off"><datalist id="analyze-suggestions"></datalist></label><button class="primary">开始分析</button></div>
+            <details><summary>结合我的真实买入情况（可选）</summary><div class="form-grid analyze-holding"><label>持仓数量<input id="analyze-quantity" type="number" min="0.0001" step="any"></label><label>买入均价<input id="analyze-cost" type="number" min="0.0001" step="any"></label><label>买入日期<input id="analyze-date" type="date"></label><label>当前可卖数量<input id="analyze-available" type="number" min="0" step="any"></label><label>保护价<input id="analyze-stop" type="number" min="0.0001" step="any"></label><label>止盈参考<input id="analyze-target" type="number" min="0.0001" step="any"></label></div></details>
+          </form>
+        </section>
+        <div id="analyze-result"><div class="empty-primary"><div><div class="empty-icon">◎</div><h2>等待输入股票</h2><p>系统会读取同一来源的日线、五分钟K线、最新报价和盘口，再分别运行四种策略。</p></div></div></div>
+      </section>
+
+      <section class="page hidden" id="strategy">
+        <div class="page-title"><div><span class="kicker" id="strategy-kicker">A股 · 策略说明</span><h1>从盘前候选到退出</h1><p>所有数字由本机规则计算，页面结论来自同一套信号、资金和持仓约束。</p></div></div>
+        <div id="strategy-content"></div>
+      </section>
+
+      <section class="page hidden" id="system">
+        <div class="page-title"><div><span class="kicker">全局 · 系统状态</span><h1>数据连接与本机提醒</h1><p>这里只检查技术状态；交易页面只显示行情正常、延迟或中断。</p></div><button class="secondary" id="benchmark">检查数据连接</button></div>
+        <section class="source-map"><article><span>A</span><div><b>A股数据路线</b><p>长桥持续行情 · 灵犀候选补充</p></div></article><article><span>US</span><div><b>美股数据路线</b><p>长桥持续行情 · 盈透核验与备用</p></div></article></section>
+        <div class="provider-grid" id="provider-cards"></div>
+        <div class="two-columns"><section class="panel"><div class="panel-head"><div><span class="kicker">Mac通知</span><h2>提醒设置</h2></div></div><div id="notification-settings"></div></section><section class="panel"><div class="panel-head"><div><span class="kicker">本机监测</span><h2>运行设置</h2></div></div><form id="settings-form" class="settings-form"><label>监测名额<input id="monitor-limit" type="number" min="1" max="40"></label><label>盈透端口<input id="ib-port" type="number" min="1024" max="65535"></label><button class="secondary">保存设置</button></form><button class="text-button" id="monitor-toggle">暂停盯盘</button><p class="muted">后台服务独立于网页和Codex运行。Mac休眠、断网或关机期间无法持续监测。</p></section></div>
+        <section class="panel"><div class="panel-head"><div><span class="kicker">检查记录</span><h2>数据样本</h2></div></div><div id="benchmarks"></div></section>
+        <section class="panel"><div class="panel-head"><div><span class="kicker">运行日志</span><h2>最近事件</h2></div></div><div id="system-events"></div></section>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="holding-dialog">
+    <form id="holding-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><span class="kicker">真实持仓</span><h2 id="holding-dialog-title">手工录入</h2></div><button type="button" class="close-button" data-close="holding-dialog" aria-label="关闭">×</button></div>
+      <input id="holding-id" type="hidden"><input id="holding-source" type="hidden">
+      <div class="form-grid"><label>股票代码<input id="holding-symbol" required maxlength="20" placeholder="600519.SH / AAPL.US"></label><label>股票名称<input id="holding-name" maxlength="80" placeholder="可选"></label><label>持仓数量<input id="holding-quantity" required type="number" min="0.0001" step="any"></label><label>买入均价<input id="holding-cost" required type="number" min="0.0001" step="any"></label><label>买入日期<input id="holding-date" type="date"></label><label>保护价<input id="holding-stop" type="number" min="0.0001" step="any"></label><label>止盈参考<input id="holding-target" type="number" min="0.0001" step="any"></label><label class="wide">备注<input id="holding-note" maxlength="300" placeholder="仓位目的、需要提醒的事项"></label></div>
+      <p class="form-hint">保护价低于成本时，未填写止盈价会按两倍初始价格风险计算。券商同步持仓只能编辑保护计划。</p>
+      <div class="dialog-actions"><button type="button" class="danger-button hidden" id="remove-holding">删除手工记录</button><span></span><button type="button" class="secondary" data-close="holding-dialog">取消</button><button type="submit" class="primary">保存计划</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="versions-dialog">
+    <div class="dialog-card"><div class="dialog-head"><div><span class="kicker">参数历史</span><h2 id="versions-title">策略版本</h2></div><button type="button" class="close-button" data-close="versions-dialog">×</button></div><div id="versions-content"></div></div>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
