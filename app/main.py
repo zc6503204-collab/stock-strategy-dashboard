@@ -200,9 +200,8 @@ async def analyze(body:AnalyzeRequest):
 
 @app.post('/api/analyze/add-monitoring')
 async def analyze_add_monitoring(body:Watch):
-    try:await dashboard.add_watch(body.symbol)
+    try:return await dashboard.add_watch(body.symbol)
     except ValueError as e:raise HTTPException(400,str(e))
-    return {'ok':True}
 
 @app.post('/api/scan')
 async def scan():
@@ -248,7 +247,7 @@ async def real_holding_sync(body:HoldingSync):
 async def connect(provider:str):
     if provider=='longbridge':
         if dashboard.lb.ctx:
-            task=asyncio.create_task(dashboard.lb.verify_access());dashboard.tasks.append(task)
+            task=asyncio.create_task(dashboard.verify_longbridge_access());dashboard.tasks.append(task)
         else:await dashboard.lb.authorize()
     elif provider=='ibkr':
         dashboard.ib_auto_connect=True;dashboard.store.set('ib_auto_connect',True)

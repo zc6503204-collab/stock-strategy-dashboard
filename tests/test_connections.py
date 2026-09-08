@@ -49,3 +49,17 @@ def test_no_listener_never_claims_connected(tmp_path,monkeypatch):
     monkeypatch.setattr('app.service.asyncio.open_connection',probe)
     assert not asyncio.run(d.connect_ib_available())
     assert d.ib.status['state']=='unavailable'
+
+
+def test_longbridge_verified_access_is_restored_after_service_restart(tmp_path):
+    dashboard=Dashboard(tmp_path)
+    access={'SH':{'quote':True,'depth':True,'subscription':True,'bars':True}}
+    async def verify():
+        dashboard.lb.status.update(packages=[{'description':'A-shares LV1 Real-time Quotes'}],verified_at=now().isoformat())
+        return access
+    from app.models import now
+    dashboard.lb.verify_access=verify
+    assert asyncio.run(dashboard.verify_longbridge_access())==access
+    restarted=Dashboard(tmp_path)
+    assert restarted.lb.status['market_access']==access
+    assert restarted.lb.status['packages'][0]['description'].startswith('A-shares')

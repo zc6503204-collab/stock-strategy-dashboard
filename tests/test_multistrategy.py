@@ -178,3 +178,43 @@ def test_single_stock_analysis_uses_cached_data_without_mutating_holdings_or_mon
     assert result['holding_origin']=='temporary' and result['holding']['quantity']==10
     assert dashboard.watch==before_watch and dashboard.real.list()==before_holdings
     assert '不会自动写入' in result['note']
+    assert result['mode']=='snapshot' and result['data_status']=='partial'
+    assert result['data_profile']['daily']['count']==70
+    assert result['data_profile']['same_time_volume']['sessions']==0
+    assert result['available_assessments']['daily_trend']
+    assert any('14日同时间' in reason for reason in result['blocked_conditions'])
+
+
+def test_chinese_name_analysis_returns_cached_partial_evidence_instead_of_no_data(tmp_path):
+    dashboard=Dashboard(tmp_path);symbol='600206.SH';start=now()-timedelta(days=90)
+    dashboard.security_map[symbol]={'code':'600206.SH','name':'有研新材','证券类型':'1'}
+    daily=[];benchmark=[]
+    for i in range(70):
+        moment=start+timedelta(days=i);price=10+i*.05
+        daily.append(Bar(symbol,'longbridge',moment,price,price+.2,price-.2,price+.1,2_000_000,30_000_000))
+        benchmark.append(Bar('000300.SH','longbridge',moment,4000+i,4002+i,3998+i,4001+i,2_000_000,1_000_000_000))
+    dashboard.strategies.context[symbol]={'daily_bars':daily,'benchmark_daily':benchmark,'daily':{},'sessions':{},'source':'longbridge'}
+    dashboard.strategies.history[symbol]=[Bar(symbol,'longbridge',now()-timedelta(minutes=10),13,13.2,12.9,13.1,10000,131000)]
+    async def no_quote(symbols):return []
+    dashboard.lingxi.quotes=no_quote
+    result=asyncio.run(dashboard.analyze_stock({'symbol':'有研新材'}))
+    assert result['symbol']==symbol and result['name']=='有研新材'
+    assert result['data_status']=='partial' and result['data_profile']['daily']['count']==70
+    assert result['technical']['ma20'] is not None and len(result['strategies'])==4
+    assert result['final']['status']=='WAIT' and dashboard.tracked()==[]
+
+
+def test_add_monitoring_reports_capacity_and_does_not_evict_existing_symbols(tmp_path):
+    dashboard=Dashboard(tmp_path);dashboard.settings['monitor_limit']=1;dashboard.watch=['MSFT.US']
+    with pytest.raises(ValueError,match='1/1'):
+        asyncio.run(dashboard.add_watch('AAPL.US'))
+    assert dashboard.watch==['MSFT.US']
+
+    dashboard.watch=[]
+    async def warm(symbols=None):
+        dashboard.validation['AAPL.US']={'ready':True,'eligible':True,'source':'longbridge'}
+        dashboard.lb.subscribed.add('AAPL.US')
+    dashboard.refresh_bars=warm;dashboard.lb.status['stream']=True
+    result=asyncio.run(dashboard.add_watch('AAPL.US'))
+    assert result['monitored'] and result['warm'] and result['transport']=='push'
+    assert result['capacity']=={'used':1,'limit':1,'available':0,'symbols':['AAPL.US']}

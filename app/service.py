@@ -26,6 +26,9 @@ class Dashboard:
         self.root=root;self.store=Store(root/'.local/dashboard.sqlite3')
         self.lingxi=Lingxi();self.lb=Longbridge();self.ib=IBKR()
         self.providers={'lingxi':self.lingxi,'longbridge':self.lb,'ibkr':self.ib}
+        saved_access=self.store.get('longbridge_access',{})
+        if saved_access:
+            self.lb.status.update({k:v for k,v in saved_access.items() if k in ['market_access','packages','verified_at']})
         self.registry=StrategyRegistry(self.store);self.strategies=ResearchEngine(self.registry);self.sim=Simulation(self.store)
         self.real=RealHoldings(self.store)
         self.alerts=Alerts(self.store,root);self.books={};self.decisions=[];self.exit_plans=[];self.real_plans=[]
@@ -102,7 +105,10 @@ class Dashboard:
                         self.tasks.append(self.ib_connect_task)
                 if self.lb.ctx and self.sdk_checked is not self.lb.ctx:
                     self.sdk_checked=self.lb.ctx
-                    self.access_pending=True;self.first_poll=True
+                    self.access_pending=False;self.first_poll=True
+                    if not self.access_task or self.access_task.done():
+                        self.access_task=asyncio.create_task(self.verify_longbridge_access())
+                        self.tasks.append(self.access_task)
                 if self.first_poll:
                     if not self.scanning:
                         task=asyncio.create_task(self.scan());self.tasks.append(task)
@@ -122,10 +128,6 @@ class Dashboard:
                         ok=await self.lb.healthcheck()
                         if not ok:
                             for s in self.tracked():self.suspend(s,'长桥连接失联，等待补齐行情')
-                    if self.access_pending and (not self.access_task or self.access_task.done()):
-                        self.access_pending=False
-                        self.access_task=asyncio.create_task(self.lb.verify_access())
-                        self.tasks.append(self.access_task)
                 self.first_poll=False;self.runtime_ok=now().isoformat();self.store.set('service_heartbeat',self.runtime_ok);self.broadcast()
             except asyncio.CancelledError:raise
             except Exception as exc:
@@ -149,6 +151,15 @@ class Dashboard:
                 self.first_poll=True;self.broadcast();return True
         self.ib.fail('等待IB Gateway／TWS登录并开启只读API；每30秒自动重试本机端口')
         self.broadcast();return False
+
+    async def verify_longbridge_access(self):
+        access=await self.lb.verify_access()
+        if access:
+            self.store.set('longbridge_access',{
+                'market_access':access,'packages':self.lb.status.get('packages',[]),
+                'verified_at':self.lb.status.get('verified_at')})
+        self.evaluate_decisions();self.broadcast()
+        return access
 
     @staticmethod
     def is_st(symbol,name):
@@ -302,12 +313,27 @@ class Dashboard:
         if not re.fullmatch(r'[A-Z0-9.\-]{1,16}\.(US|SH|SZ)',symbol) or not self.allowed_security({'symbol':symbol,'name':self.security_map.get(symbol,{}).get('name','')}):
             raise ValueError('请输入码表内的美股、沪深主板或创业板股票，例如 AAPL.US、300750.SZ')
         if symbol not in self.watch:
-            if len(self.tracked())>=self.settings['monitor_limit']:raise ValueError('监测名额已满，请先移除一只或增加名额')
+            if len(self.tracked())>=self.settings['monitor_limit']:
+                names='、'.join(self.tracked())
+                raise ValueError(f"监测名额已满（{len(self.tracked())}/{self.settings['monitor_limit']}）：{names}。请先移除一只或增加名额")
             self.watch.append(symbol);self.store.set('watch',self.watch)
             self.manual_watch=list(dict.fromkeys(self.manual_watch+[symbol]));self.store.set('manual_watch',self.manual_watch)
-        q=await self.lingxi.quotes([symbol])
-        for item in q:self.accept_quote(item)
+        quotes=[]
+        if self.lb.ctx:
+            try:quotes=await self.lb.quotes([symbol])
+            except Exception:quotes=[]
+        if not quotes and symbol_market(symbol)=='CN':
+            try:quotes=await asyncio.wait_for(self.lingxi.quotes([symbol]),5)
+            except Exception:quotes=[]
+        for item in quotes:self.accept_quote(item)
         await self.refresh_bars([symbol]);self.broadcast()
+        monitored=symbol in self.tracked();subscribed=symbol in self.lb.subscribed
+        return {'ok':True,'symbol':symbol,'monitored':monitored,
+                'warm':bool(self.validation.get(symbol,{}).get('ready')),
+                'transport':'push' if subscribed and self.lb.status.get('stream') else 'polling' if monitored and self.lb.ctx else 'unavailable',
+                'capacity':{'used':len(self.tracked()),'limit':self.settings['monitor_limit'],
+                            'available':max(0,self.settings['monitor_limit']-len(self.tracked())),
+                            'symbols':self.tracked()}}
 
     async def remove_watch(self,symbol):
         if any(symbol in a['positions'] for a in self.sim.state['accounts'].values()):raise ValueError('模拟持仓仍需监测，退出后再移除')
@@ -620,6 +646,31 @@ class Dashboard:
             # Direct unit-level configuration changes have no running service loop.
             pass
 
+    def analysis_transport(self,symbol):
+        """Describe how this symbol is being refreshed without overstating feed quality."""
+        monitored=symbol in self.tracked()
+        if not self.monitor_running:return 'stopped','盯盘已暂停'
+        if not monitored:return 'snapshot','即时快照'
+        if symbol in self.lb.subscribed and self.lb.status.get('stream'):
+            return 'push','实时盯盘'
+        if self.lb.ctx:return 'polling','15秒查询'
+        return 'unavailable','行情不可用'
+
+    @staticmethod
+    def analysis_daily_required(strategy,config):
+        if strategy=='trend_pullback':return max(25,int(config['daily_slow'])+5)
+        if strategy=='volatility_breakout':return max(25,int(config['atr_long'])+1,int(config['breakout_days']))
+        return max(25,int(config.get('daily_ma',20))+5)
+
+    def market_transport(self,market,tracked,ready):
+        subscribed=sum(s in self.lb.subscribed for s in tracked)
+        if not self.monitor_running:return 'stopped','盯盘已暂停',subscribed
+        if not monitoring_window(now(),market):return 'stopped','当前时段不请求新行情',subscribed
+        if tracked and subscribed>=ready>0 and self.lb.status.get('stream'):
+            return 'push','行情推送',subscribed
+        if tracked and self.lb.ctx:return 'polling','15秒查询补充',subscribed
+        return 'unavailable','行情连接不可用',subscribed
+
     async def analyze_stock(self,data):
         symbol=str(data.get('symbol','')).upper().strip()
         if not re.fullmatch(r'[A-Z0-9.\-]{1,16}\.(US|SH|SZ)',symbol):
@@ -655,14 +706,15 @@ class Dashboard:
         historical=[previous[k] for k in sorted(previous)]
         benchmark_intraday=list(self.strategies.benchmarks.get(market,[]))
         quote=self.quotes.get(symbol)
-        references={}
+        references={};fetch_errors=[]
 
         # A one-off analysis must remain responsive. Fill only missing pieces in
         # parallel and keep an honest WAIT result when a provider is slow.
         if self.lb.ctx:
             jobs={}
             if len(daily)<25:jobs['daily']=asyncio.create_task(asyncio.wait_for(self.lb.bars(symbol,'day',130),8))
-            if len(current_bars)<2:jobs['intraday']=asyncio.create_task(asyncio.wait_for(self.lb.bars(symbol,'5m',1000),8))
+            stale_bar=is_open(now(),market) and (not current_bars or (now()-current_bars[-1].end).total_seconds()>390)
+            if len(current_bars)<2 or stale_bar:jobs['intraday']=asyncio.create_task(asyncio.wait_for(self.lb.bars(symbol,'5m',1000),8))
             if len(benchmark_daily)<21:jobs['benchmark_daily']=asyncio.create_task(asyncio.wait_for(self.lb.bars(BENCHMARKS[market],'day',130),8))
             if not benchmark_intraday:jobs['benchmark_intraday']=asyncio.create_task(asyncio.wait_for(self.lb.bars(BENCHMARKS[market],'5m',1000),8))
             if not candidate.get('name'):jobs['reference']=asyncio.create_task(asyncio.wait_for(self.lb.reference_info([symbol]),5))
@@ -671,6 +723,7 @@ class Dashboard:
             if jobs:
                 values=await asyncio.gather(*jobs.values(),return_exceptions=True)
                 fetched=dict(zip(jobs,values))
+                fetch_errors=[key for key,value in fetched.items() if isinstance(value,Exception)]
                 if isinstance(fetched.get('daily'),list):
                     daily=[b for b in fetched['daily'] if local_date(b.start,market)<day]
                     if daily:self.store.set('selection_daily:'+symbol,{'fetched_date':str(day),'bars':[b.dump() for b in daily]})
@@ -686,6 +739,13 @@ class Dashboard:
                     benchmark_intraday=[b for b in fetched['benchmark_intraday'] if b.final and b.end<=now() and is_open(b.start,market)]
                 if isinstance(fetched.get('reference'),dict):references=fetched['reference']
                 if isinstance(fetched.get('quote'),list) and fetched['quote']:quote=fetched['quote'][0]
+        # Lingxi may provide a supplemental A-share display quote. It never
+        # becomes the source for Longbridge bars or volume-based confirmation.
+        if not quote and market=='CN':
+            try:
+                supplemental=await asyncio.wait_for(self.lingxi.quotes([symbol]),5)
+                if supplemental:quote=supplemental[0]
+            except Exception:fetch_errors.append('supplemental_quote')
         name=references.get(symbol,{}).get('name') or candidate.get('name') or self.security_map.get(symbol,{}).get('name') or symbol
         if cached:
             context=self.strategies.context[symbol];daily=context.get('daily_bars',[]);benchmark_daily=context.get('benchmark_daily',[])
@@ -701,18 +761,50 @@ class Dashboard:
                 for bar in intraday:signals.extend(engine.update(bar,risk_group))
                 preview=engine.preview(symbol).get('strategies',{})
         risk_group='st' if self.is_st(symbol,name) else 'smallcap' if (_atr_pct(daily)>=5) else 'normal'
-        if quote and is_open(now(),market):
+        observed_at=now();open_now=is_open(observed_at,market);market_phase=phase(observed_at,market)
+        if quote and quote.source=='longbridge' and open_now:
             try:
                 book=await asyncio.wait_for(self.lb.depth(symbol),3)
                 if book and book.get('source')==quote.source:
                     for key in ['bid','ask','bid_size','ask_size','depth_time']:setattr(quote,key,book[key])
             except Exception:pass
+        observed_at=now();open_now=is_open(observed_at,market);market_phase=phase(observed_at,market)
         base=self.registry.config('breakout',market)
         factors=daily_factors(symbol,daily,benchmark_daily,liquidity_min=base['liquidity_min'],rs_min=base['relative_strength_min'])
         cap=references.get(symbol,{}).get('total_shares');cap=cap*daily[-1].close if cap and daily else candidate.get('market_cap')
+        if not cap and quote and quote.market_cap:cap=quote.market_cap
         existing_validation=self.validation.get(symbol,{}) if cached else {}
-        data_ready=len(daily)>=25 and len(benchmark_daily)>=21 and len(intraday)>=2
         source=intraday[-1].source if intraday else daily[-1].source if daily else 'longbridge'
+        today_bars=sorted([b for b in intraday if b.final and b.end<=observed_at and local_date(b.start,market)==day],key=lambda b:b.start)
+        if cached:
+            history_groups=self.strategies.context.get(symbol,{}).get('sessions',{})
+        else:
+            history_groups={}
+            for bar in historical:history_groups.setdefault(local_date(bar.start,market),{})[bar.start]=bar
+        from zoneinfo import ZoneInfo
+        zone=ZoneInfo('Asia/Shanghai' if market=='CN' else 'America/New_York')
+        today_clocks={b.start.astimezone(zone).strftime('%H:%M') for b in today_bars}
+        baseline_sessions=0
+        for session in sessions:
+            rows=history_groups.get(session.date(),{})
+            clocks={b.start.astimezone(zone).strftime('%H:%M') for b in rows.values()}
+            if rows and (not today_clocks or today_clocks.issubset(clocks)):baseline_sessions+=1
+        benchmark_today={b.start:b for b in benchmark_intraday
+                         if b.final and b.end<=observed_at and local_date(b.start,market)==day}
+        benchmark_synced=bool(today_bars) and all(
+            b.start in benchmark_today and benchmark_today[b.start].source==b.source for b in today_bars)
+        quote_market_age=(observed_at-quote.market_time).total_seconds() if quote and quote.market_time else None
+        quote_receive_age=(observed_at-quote.received_at).total_seconds() if quote else None
+        depth_age=(observed_at-quote.depth_time).total_seconds() if quote and quote.depth_time else None
+        bar_age=(observed_at-today_bars[-1].end).total_seconds() if today_bars else None
+        bars_timely=bool(bar_age is not None and -5<=bar_age<=390)
+        quote_timely=bool(quote and quote.source==source and quote_market_age is not None and quote_receive_age is not None
+                          and 0<=quote_market_age<=30 and 0<=quote_receive_age<=30)
+        quote_current=bool(quote_timely and quote.quality=='realtime')
+        depth_timely=bool(quote and quote.source==source and depth_age is not None and 0<=depth_age<=15
+                          and quote.bid and quote.ask and quote.ask>=quote.bid)
+        depth_current=bool(depth_timely and quote_current)
+        data_ready=len(daily)>=25 and len(benchmark_daily)>=21 and len(today_bars)>=2
         validation={'ready':data_ready,'eligible':bool(existing_validation.get('eligible',factors.get('eligible') and cap)),
                     'source':source,'risk_group':risk_group,
                     'atr_pct':_atr_pct(daily),'average_turnover':factors.get('average_turnover'),
@@ -729,34 +821,121 @@ class Dashboard:
                               'target':holding_input.get('target'),'note':'临时分析','updated_at':now().isoformat()})
             holding_origin='temporary'
         decisions=recommend([s.dump() for s in signals],{symbol:quote} if quote else {},{symbol:validation},
-                            self.sim.state,now(),temporary,self.registry.active_versions())
+                            self.sim.state,observed_at,temporary,self.registry.active_versions())
         per_strategy=[]
         for strategy,definition in DEFINITIONS.items():
+            config=self.registry.config(strategy,market)
+            required_daily=self.analysis_daily_required(strategy,config)
+            if strategy=='trend_pullback':
+                strategy_daily=daily_factors(symbol,daily,benchmark_daily,config['daily_fast'],config['daily_slow'],config['liquidity_min'],config['relative_strength_min'])
+                required_intraday=int(config['intraday_ema'])+1
+            elif strategy=='volatility_breakout':
+                strategy_daily=daily_factors(symbol,daily,benchmark_daily,config['daily_ma'],None,config['liquidity_min'],config['relative_strength_min'])
+                required_intraday=2
+            else:
+                strategy_daily=factors;required_intraday=int(config['opening_bars'])+1
+            needs_baseline=strategy in ('breakout','pullback','volatility_breakout')
+            requirements={'日线数据':len(daily)>=required_daily,
+                          '今日完整5分钟K线':len(today_bars)>=required_intraday,
+                          '最新完整K线':bars_timely,
+                          '同源基准盘中同步':benchmark_synced,
+                          '实时报价':quote_current,'买卖盘':depth_current}
+            if needs_baseline:requirements['14日同时间量能']=baseline_sessions>=14
             decision=next((r for r in decisions if r['strategy']==strategy or strategy in r.get('strategies',[])),None)
-            view=preview.get(strategy,{'status':'wait','ready':False,'reason':validation['reason']})
+            view=preview.get(strategy)
+            if not view:
+                if len(daily)<required_daily:reason=f'日线数据预热中（{len(daily)}/{required_daily}）'
+                elif len(benchmark_daily)<21:reason=f'基准日线预热中（{len(benchmark_daily)}/21）'
+                elif len(today_bars)<required_intraday:reason=f'等待今日完整5分钟K线（{len(today_bars)}/{required_intraday}）'
+                elif not benchmark_synced:reason='等待同源基准同步至当前完整K线'
+                elif needs_baseline and baseline_sessions<14:reason=f'趋势可判断，等待14日同时间成交量基线（{baseline_sessions}/14）'
+                else:reason=validation['reason']
+                view={**strategy_daily,'status':'wait','ready':False,'reason':reason}
+            view={**view,'requirements':requirements}
             state='符合' if decision and decision.get('state')=='buy' else '不适用' if view.get('status')=='disabled' else '等待'
             per_strategy.append({'strategy':strategy,'name':definition['name'],'version':self.registry.current(strategy,market)['version'],
                                  'state':state,'reason':decision.get('reason') if decision else view.get('reason'),
-                                 'conditions':view,'decision':decision,'enabled':self.registry.enabled(strategy,market)})
+                                 'conditions':view,'requirements':requirements,'decision':decision,
+                                 'enabled':self.registry.enabled(strategy,market)})
         entered=next((p for p in temporary if p['symbol']==symbol and p.get('quantity',0)>0),None)
-        holding_plan_row=real_holding_plan(entered,quote,now(),validation) if entered else None
+        holding_plan_row=real_holding_plan(entered,quote,observed_at,validation) if entered else None
         buy=next((r for r in decisions if r.get('state')=='buy'),None)
         if holding_plan_row:final={'status':'MANAGE','action':holding_plan_row['action'],'reason':holding_plan_row['reason']}
         elif buy:final={'status':'BUY','action':'可考虑买入','reason':buy['reason'],'decision':buy}
-        elif not is_open(now(),market):
-            final={'status':'WAIT','action':'继续等待','reason':'当前休市；开盘后用新的完整K线、报价和盘口重新判断'}
+        elif not daily and not today_bars and not quote:
+            final={'status':'WAIT','action':'数据暂不可用','reason':'当前未取得日线、5分钟K线或行情，请检查长桥权限与网络'}
+        elif not open_now:
+            final={'status':'WAIT','action':'继续等待','reason':f'当前{market_phase}；保留最近有效数据，开盘后用新的完整K线、报价和盘口重新判断'}
         elif not validation['ready']:
             final={'status':'WAIT','action':'继续等待','reason':validation['reason']}
-        elif not fresh_quote(quote,now(),source):
+        elif not fresh_quote(quote,observed_at,source):
             final={'status':'WAIT','action':'暂不买入','reason':'实时报价超过30秒或权限未确认，统一风控已否决买入'}
         else:
             reasons=[r['reason'] for r in per_strategy if r.get('reason')]
             final={'status':'WAIT','action':'继续等待',
                    'reason':reasons[0] if reasons else validation['reason']}
+        transport,transport_label=self.analysis_transport(symbol)
+        research_full=(len(daily)>=max(self.analysis_daily_required(k,self.registry.config(k,market)) for k in DEFINITIONS)
+                       and len(benchmark_daily)>=21 and len(today_bars)>=2 and benchmark_synced and baseline_sessions>=14)
+        if not daily and not today_bars and not quote:data_status='unavailable'
+        elif open_now and (not bars_timely or (quote and not quote_timely)):data_status='stale'
+        elif open_now and (not quote_current or not depth_current):data_status='warming' if symbol in self.tracked() else 'partial'
+        elif research_full:data_status='full'
+        elif symbol in self.tracked():data_status='warming'
+        else:data_status='partial'
+        blocked=[]
+        if len(daily)<25:blocked.append(f'日线数据 {len(daily)}/25')
+        if len(benchmark_daily)<21:blocked.append(f'基准日线 {len(benchmark_daily)}/21')
+        if len(today_bars)<2:blocked.append(f'今日完整5分钟K线 {len(today_bars)}/2')
+        elif open_now and not bars_timely:blocked.append(f'最新完整5分钟K线已延迟 {round(bar_age/60,1) if bar_age is not None else "—"}分钟')
+        if not benchmark_synced:blocked.append('同源基准尚未同步')
+        if baseline_sessions<14:blocked.append(f'14日同时间成交量基线 {baseline_sessions}/14')
+        if open_now and not quote_timely:blocked.append('报价时间超过30秒')
+        elif open_now and quote and quote.quality!='realtime':blocked.append('行情订阅权限尚未确认')
+        if open_now and not depth_timely:blocked.append('买卖盘时间超过15秒或数据缺失')
+        elif open_now and not quote_current:blocked.append('买卖盘已取得，但需等待行情权限确认')
+        if not open_now:blocked.append(f'当前{market_phase}')
+        if quote and quote.source!=source:blocked.append(f'{source}策略K线与{quote.source}补充报价不混算')
+        technical={'last_close':daily[-1].close if daily else None,
+                   'ma20':sum(b.close for b in daily[-20:])/20 if len(daily)>=20 else None,
+                   'ma60':sum(b.close for b in daily[-60:])/60 if len(daily)>=60 else None,
+                   'high10':max((b.high for b in daily[-10:]),default=None),
+                   'high20':max((b.high for b in daily[-20:]),default=None),
+                   'structure_low':min((b.low for b in (today_bars[-4:] or daily[-5:])),default=None),
+                   'relative_strength':factors.get('relative_strength'),'average_turnover':factors.get('average_turnover'),
+                   'atr_pct':_atr_pct(daily) if len(daily)>=21 else None,'trend':factors.get('trend')}
+        next_confirmation=(today_bars[-1].end+timedelta(minutes=5)).isoformat() if open_now and bars_timely else None
+        profile={'daily':{'count':len(daily),'required':25,'start':daily[0].start.isoformat() if daily else None,
+                          'end':daily[-1].start.isoformat() if daily else None},
+                 'intraday':{'count':len(today_bars),'last_bar_at':today_bars[-1].end.isoformat() if today_bars else None,
+                             'age_seconds':round(bar_age,1) if bar_age is not None else None,'timely':bars_timely},
+                 'same_time_volume':{'sessions':baseline_sessions,'required':14},
+                 'benchmark':{'symbol':BENCHMARKS[market],'daily_count':len(benchmark_daily),
+                              'intraday_count':len(benchmark_today),'synced':benchmark_synced},
+                 'quote':{'available':bool(quote),'source':quote.source if quote else None,'quality':quote.quality if quote else None,
+                          'market_time':quote.market_time.isoformat() if quote and quote.market_time else None,
+                          'received_at':quote.received_at.isoformat() if quote else None,
+                          'market_age_seconds':round(quote_market_age,1) if quote_market_age is not None else None,
+                          'receive_age_seconds':round(quote_receive_age,1) if quote_receive_age is not None else None,
+                          'timely':quote_timely,'fresh':quote_current},
+                 'depth':{'available':bool(quote and quote.bid and quote.ask),'time':quote.depth_time.isoformat() if quote and quote.depth_time else None,
+                          'age_seconds':round(depth_age,1) if depth_age is not None else None,'timely':depth_timely,'fresh':depth_current},
+                 'fetch_errors':fetch_errors}
+        monitoring={'used':len(self.tracked()),'limit':self.settings['monitor_limit'],
+                    'available':max(0,self.settings['monitor_limit']-len(self.tracked())),
+                    'symbols':self.tracked()}
         return {'symbol':symbol,'name':name,'market':market,'monitored':symbol in self.tracked(),
                 'quote':quote.dump() if quote else None,'validation':validation,'strategies':per_strategy,
-                'holding':holding_plan_row,'holding_origin':holding_origin,'final':final,'analyzed_at':now().isoformat(),'source':source,
-                'note':'临时分析不会自动写入持仓或占用持续监测名额'}
+                'holding':holding_plan_row,'holding_origin':holding_origin,'final':final,'analyzed_at':observed_at.isoformat(),'source':source,
+                'mode':'monitoring' if symbol in self.tracked() else 'snapshot','transport':transport,'transport_label':transport_label,
+                'data_status':data_status,'data_profile':profile,'technical':technical,
+                'available_assessments':{'daily_trend':len(daily)>=25 and len(benchmark_daily)>=21,
+                                         'intraday_structure':len(today_bars)>=2 and benchmark_synced,
+                                         'same_time_volume':baseline_sessions>=14,
+                                         'execution':quote_current and depth_current and open_now},
+                'blocked_conditions':blocked,'refresh_pending':bool(symbol in self.tracked() and self.lb.ctx and data_status in ('warming','stale')),
+                'next_confirmation_at':next_confirmation,'market_phase':market_phase,'monitoring':monitoring,
+                'note':'已加入持续监测；本机规则会自动更新，不调用AI' if symbol in self.tracked() else '即时快照不会自动写入持仓或占用监测名额；点击加入后才持续跟踪'}
 
     def market_workspace(self,market,rows,simulation,alerts):
         """One self-contained market payload for the decision-first UI."""
@@ -806,12 +985,19 @@ class Dashboard:
         market_alerts=[a for a in alerts if a.get('symbol') and suffix(a['symbol'])]
         market_quotes=[self.quotes[s] for s in tracked if s in self.quotes]
         latest=max((q.market_time for q in market_quotes if q.market_time),default=None)
+        latest_received=max((q.received_at for q in market_quotes),default=None)
+        last_bars=[stamp(self.details[s]['last_bar']) for s in tracked if self.details.get(s,{}).get('last_bar')]
+        latest_bar=max(last_bars,default=None)
         ready=sum(bool(self.validation.get(s,{}).get('ready')) for s in tracked)
         fresh=sum(fresh_quote(self.quotes.get(s),now()) for s in tracked)
         uncovered=sum(s not in tracked for s in self.real.symbols() if suffix(s))
-        open_now=is_open(now(),market)
+        current_time=now();open_now=is_open(current_time,market);market_phase=phase(current_time,market)
+        transport,transport_label,subscription_count=self.market_transport(market,tracked,ready)
+        quote_age=(current_time-latest).total_seconds() if latest else None
         if not self.monitor_running:health_state='paused';health_text='盯盘已暂停'
-        elif not open_now:health_state='closed';health_text='休市，保留最近有效数据'
+        elif not open_now:
+            health_state='closed'
+            health_text='午间休市，保留11:30封盘数据' if market_phase=='午间休市' else f'{market_phase}，保留最近有效数据'
         elif not tracked or ready==0:health_state='error';health_text='行情中断或尚未预热'
         elif fresh<len(tracked):health_state='delayed';health_text=f'{len(tracked)-fresh}只报价待更新'
         else:health_state='healthy';health_text='行情正常'
@@ -825,10 +1011,16 @@ class Dashboard:
         return {
             'meta':{'market':market,'name':'A股' if market=='CN' else '美股','currency':'CNY' if market=='CN' else 'USD',
                     'currency_symbol':'¥' if market=='CN' else '$','benchmark':'沪深300' if market=='CN' else 'SPY',
-                    'timezone':'Asia/Shanghai' if market=='CN' else 'America/New_York','phase':phase(now(),market),'open':open_now},
+                    'timezone':'Asia/Shanghai' if market=='CN' else 'America/New_York','phase':market_phase,'open':open_now},
             'health':{'state':health_state,'text':health_text,'tracked':len(tracked),'ready':ready,'fresh':fresh,
                       'uncovered_holdings':uncovered,'data_as_of':latest.isoformat() if latest else self.store.get('selection_updated'),
-                      'issues':issues},
+                      'issues':issues,'transport':transport,'transport_label':transport_label,
+                      'quote_age_seconds':round(quote_age,1) if quote_age is not None else None,
+                      'last_quote_at':latest.isoformat() if latest else None,
+                      'last_received_at':latest_received.isoformat() if latest_received else None,
+                      'last_bar_at':latest_bar.isoformat() if latest_bar else None,
+                      'active_subscriptions':subscription_count,'monitor_limit':self.settings['monitor_limit'],
+                      'phase_reason':health_text},
             'decision':{'status':status,'headline':headline,'primary':primary,'backups':backups,'watching':watching,
                         'reason':'有持仓退出条件需要先处理' if urgent else '买点已通过完整K线、现价、盘口与资金检查' if primary else '尚无股票同时通过盘中触发、实时行情、盘口和风险检查'},
             'premarket':premarket,'candidates':candidates,

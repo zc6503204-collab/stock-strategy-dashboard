@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime,timedelta,timezone
 
 from app.models import Quote, now
 from app.service import Dashboard
@@ -72,3 +72,19 @@ def test_workspace_holding_action_overrides_buy_and_fallback_is_renderable(tmp_p
     assert us['holdings']['real'][0]['action'] == '需要设置保护价'
     assert us['decision']['status'] == 'MANAGE'
     assert us['decision']['headline'] == '先处理持仓风险'
+
+
+def test_lunch_health_keeps_last_quote_without_reporting_feed_failure(tmp_path,monkeypatch):
+    fixed=datetime(2026,9,8,4,0,tzinfo=timezone.utc)  # 12:00 Beijing time.
+    monkeypatch.setattr('app.service.now',lambda:fixed)
+    dashboard=Dashboard(tmp_path);symbol='600001.SH';dashboard.watch=[symbol]
+    dashboard.validation[symbol]={'ready':True,'eligible':True,'source':'longbridge'}
+    dashboard.lb.status.update(stream=True,state='connected')
+    dashboard.lb.subscribed.add(symbol)
+    dashboard.quotes[symbol]=Quote(symbol,'longbridge','样本',10,fixed-timedelta(minutes=30),fixed-timedelta(minutes=30),quality='realtime')
+    dashboard.details[symbol]={'last_bar':(fixed-timedelta(minutes=35)).isoformat()}
+    health=dashboard.snapshot()['workspaces']['CN']['health']
+    assert health['state']=='closed' and '午间休市' in health['text']
+    assert health['last_quote_at'] and health['last_bar_at']
+    assert health['active_subscriptions']==1 and health['monitor_limit']==12
+    assert health['quote_age_seconds']==1800
