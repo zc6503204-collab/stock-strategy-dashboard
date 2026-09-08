@@ -200,9 +200,9 @@ class Longbridge(Provider):
             result.append(Bar(symbol,'longbridge',sdk_stamp(r.timestamp),o,h,l,c,v,float(r.turnover)))
         return result
 
-    async def bars(self,symbol,period='5m',count=250):
+    async def bars(self,symbol,period='5m',count=250,force_cli=False):
         async with self.lock:
-            if self.ctx:
+            if self.ctx and not force_cli:
                 from longbridge.openapi import Period,AdjustType
                 rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.candlesticks,symbol,Period.Day if period=='day' else Period.Min_5,count,AdjustType.NoAdjust),20)
                 data=[{'time':sdk_stamp(r.timestamp),'open':r.open,'high':r.high,'low':r.low,'close':r.close,'volume':r.volume,'turnover':r.turnover} for r in rows]

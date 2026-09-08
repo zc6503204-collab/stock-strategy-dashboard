@@ -211,7 +211,7 @@ async def analyze_add_monitoring(body:Watch):
 @app.post('/api/scan')
 async def scan():
     if not dashboard.scanning:
-        task=asyncio.create_task(dashboard.scan());dashboard.tasks.append(task)
+        task=asyncio.create_task(dashboard.scan(force_strategy=True));dashboard.tasks.append(task)
     return {'ok':True}
 
 @app.post('/api/settings')

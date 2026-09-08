@@ -1,6 +1,6 @@
 from datetime import timedelta
 from app.models import Bar,stamp
-from app.selection import evaluate,candidate_pool
+from app.selection import evaluate,candidate_pool,ranking_key
 
 def daily(step=.1,amount=2e8):
     t=stamp('2026-06-01T01:30Z')
@@ -34,3 +34,13 @@ def test_auction_reset_retains_researched_names_with_bounded_unique_pool():
     symbols=[r['symbol'] for r in pool]
     assert symbols[0]=='old30' and 'old0' in symbols and 'new0' in symbols
     assert len(symbols)==len(set(symbols))==80
+
+def test_strategy_candidates_are_kept_before_rank_supplements():
+    current=[{'symbol':f'rank{i}','candidate_strategies':[]} for i in range(5)]
+    current += [{'symbol':'strategy1','candidate_strategies':['trend_pullback']},{'symbol':'strategy2','candidate_strategies':['vcp_swing']}]
+    assert [r['symbol'] for r in candidate_pool(current,[],set(),limit=2)]==['strategy1','strategy2']
+
+def test_strategy_match_breaks_equal_decision_ties_before_generic_score():
+    base={'decision':'重点观察','score':100,'distance_to_high_pct':0,'candidate_strategies':[]}
+    matched={**base,'score':80,'candidate_strategies':['trend_pullback']}
+    assert sorted([base,matched],key=ranking_key)[0] is matched

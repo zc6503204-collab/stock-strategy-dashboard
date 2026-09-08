@@ -41,6 +41,13 @@ def test_workspaces_are_isolated_and_limit_decision_slots(tmp_path, monkeypatch)
         _buy('300001.SZ', 3), _buy('600002.SH', 4), _buy('AAPL.US', 5),
     ]
     snapshot = dashboard.snapshot()
+    assert snapshot['coverage']['full_market'] is False
+    assert snapshot['coverage']['scope_label'] == '灵犀全市场策略初筛，本地仅复核返回候选'
+    assert snapshot['coverage']['candidates_by_market'] == {'CN': 1, 'US': 1}
+    assert snapshot['coverage']['strategy_candidates_by_market'] == {'CN': 0, 'US': 0}
+    assert snapshot['coverage']['supplement_candidates_by_market'] == {'CN': 1, 'US': 1}
+    assert snapshot['coverage']['research_pool_by_market'] == {'CN': 0, 'US': 0}
+    assert snapshot['coverage']['selection_by_market'] == {'CN': 2, 'US': 1}
     cn, us = snapshot['workspaces']['CN'], snapshot['workspaces']['US']
     assert cn['meta']['currency'] == 'CNY' and cn['meta']['benchmark'] == '沪深300'
     assert us['meta']['currency'] == 'USD' and us['meta']['benchmark'] == 'SPY'
@@ -72,6 +79,13 @@ def test_workspace_holding_action_overrides_buy_and_fallback_is_renderable(tmp_p
     assert us['holdings']['real'][0]['action'] == '需要设置保护价'
     assert us['decision']['status'] == 'MANAGE'
     assert us['decision']['headline'] == '先处理持仓风险'
+
+def test_premarket_prefers_strategy_matches_within_same_decision(tmp_path):
+    dashboard=Dashboard(tmp_path)
+    generic=_selection('600001.SH','CN',1);generic['score']=100
+    matched=_selection('000001.SZ','CN',2);matched.update(score=70,candidate_strategies=['trend_pullback'])
+    dashboard.selection=[generic,matched]
+    assert dashboard.premarket('CN')[0]['symbol']=='000001.SZ'
 
 
 def test_lunch_health_keeps_last_quote_without_reporting_feed_failure(tmp_path,monkeypatch):

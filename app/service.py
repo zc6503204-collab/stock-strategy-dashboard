@@ -11,12 +11,23 @@ from .alerts import Alerts
 from .calendars import calendar,monitoring_window,close_time
 from .simulation import Simulation
 from .store import Store
-from .selection import evaluate as evaluate_selection,candidate_pool
+from .selection import evaluate as evaluate_selection,candidate_pool,ranking_key as selection_rank
 from .holdings import RealHoldings,real_holding_plan
 from .strategy_registry import StrategyRegistry,DEFINITIONS
 
 DAILY_FETCH_COUNT=270
 DAILY_CACHE_MIN=260
+
+STRATEGY_SCREEN_GROUPS=(
+    {'id':'breakout','strategies':['breakout','pullback'],'name':'突破准备',
+     'query':'A股全市场的主板和创业板中，20日平均成交额大于1亿元，20日均线向上，最新价高于20日均线且距离20日最高价不超过5%的股票，按20日涨幅从高到低排序，最多返回40只'},
+    {'id':'trend_pullback','strategies':['trend_pullback'],'name':'趋势回踩',
+     'query':'A股全市场的主板和创业板中，20日平均成交额大于1亿元，最新价高于60日均线，20日均线高于60日均线且20日均线向上，最新价距离20日均线不超过2%的股票，按20日涨幅从高到低排序，最多返回40只'},
+    {'id':'trend_rsi_pullback','strategies':['trend_rsi_pullback'],'name':'RSI回踩',
+     'query':'A股全市场的主板和创业板中，20日平均成交额大于1亿元，最新价高于60日均线，20日均线高于60日均线且向上，最近5日RSI14最大值大于等于65，当前RSI14在45到60之间，最新价距离20日均线不超过2%，5日平均成交量小于20日平均成交量的80%，按20日涨幅从高到低排序，最多返回40只'},
+    {'id':'volatility_contraction','strategies':['volatility_breakout','vcp_swing'],'name':'波动收缩',
+     'query':'A股全市场的主板和创业板中，20日平均成交额大于1亿元，EMA10高于EMA20且EMA20高于EMA50，EMA50向上，ATR5小于ATR20的75%，最新价距离60日最高价不超过5%，最近5日平均振幅小于此前20日平均振幅的75%，按60日涨幅从高到低排序，最多返回40只'},
+)
 
 def _atr_pct(bars):
     if len(bars)<21 or not bars[-1].close:return 999.
@@ -48,7 +59,7 @@ class Dashboard:
         self.lb.on_quote=self.accept_quote;self.lb.on_bar=self.accept_bar
         self.sdk_checked=None
         self.ib_auto_connect=self.store.get('ib_auto_connect',False);self.last_ib_attempt=0.
-        self.selection=self.store.get('selection',[]);self.selection_running=False
+        self.selection=sorted(self.store.get('selection',[]),key=selection_rank);self.selection_running=False
         self.selection_progress={'done':0,'total':0};self.selection_errors=[];self.selection_task=None
         self.holding_sync=self.store.get('holding_sync',{
             'longbridge':{'state':'waiting','message':'等待首次同步'},
@@ -179,14 +190,64 @@ class Dashboard:
         ref=self.security_map.get(symbol)
         return bool(ref and str(ref.get('证券类型'))=='1')
 
-    async def scan(self):
+    async def strategy_candidate_scan(self,force=False):
+        marker=str(local_date(now(),'CN'))
+        cached=self.store.get('strategy_candidate_screen',{})
+        if not force and cached.get('date')==marker:return cached.get('rows',[]),cached
+        rows=[];queries=[];errors=[]
+        for group in STRATEGY_SCREEN_GROUPS:
+            active=[s for s in group['strategies'] if self.registry.enabled(s,'CN')]
+            if not active:continue
+            try:
+                data=await self.lingxi.call('screen',group['query'])
+                raw=data.get('text') if isinstance(data,dict) else None
+                if not isinstance(raw,str):raw=json.dumps(data,ensure_ascii=False)
+                found=[]
+                for code,market in re.findall(r'\b(\d{6})\.?((?:SH|SZ))\b',raw):
+                    symbol=code+'.'+market
+                    row={'symbol':symbol,'name':self.security_map.get(symbol,{}).get('name',symbol)}
+                    if self.allowed_security(row) and symbol not in found:found.append(symbol)
+                for symbol in found:
+                    rows.append({'symbol':symbol,'name':self.security_map.get(symbol,{}).get('name',symbol),
+                        'source':'lingxi','reason':'策略初筛：'+group['name'],'scope':'灵犀按策略条件筛选A股全市场',
+                        'candidate_origin':'strategy','candidate_strategies':active,'screen_group':group['id']})
+                queries.append({'group':group['id'],'name':group['name'],'strategies':active,'returned':len(found)})
+            except Exception as exc:
+                errors.append({'group':group['id'],'name':group['name'],'reason':str(exc)[:120]})
+        unique={}
+        for row in rows:
+            current=unique.get(row['symbol'])
+            if current:
+                current['candidate_strategies']=list(dict.fromkeys(current['candidate_strategies']+row['candidate_strategies']))
+                current['reason']='策略初筛：'+'、'.join(DEFINITIONS[s]['name'] for s in current['candidate_strategies'])
+            else:unique[row['symbol']]=row
+        result={'date':marker,'updated_at':now().isoformat(),'rows':list(unique.values()),'queries':queries,'errors':errors}
+        self.store.set('strategy_candidate_screen',result)
+        return result['rows'],result
+
+    @staticmethod
+    def merge_candidate(unique,row):
+        current=unique.get(row['symbol'])
+        if not current:unique[row['symbol']]=row;return
+        strategies=list(dict.fromkeys(current.get('candidate_strategies',[])+row.get('candidate_strategies',[])))
+        if strategies:
+            current['candidate_strategies']=strategies
+            current['candidate_origin']='strategy'
+            current['reason']='策略初筛：'+'、'.join(DEFINITIONS[s]['name'] for s in strategies)
+        for key,value in row.items():
+            if current.get(key) is None and value is not None:current[key]=value
+
+    async def scan(self,force_strategy=False):
         if self.scanning:return
         self.scanning=True;self.broadcast()
         try:
-            rows=[]
+            strategy_rows,_=await self.strategy_candidate_scan(force_strategy)
+            rows=list(strategy_rows)
             # One serialized request per provider, bounded candidate universe, no full-market claim.
             for order in [10,2]:
                 found,stats=await self.lingxi.rank(order)
+                for row in found:
+                    row.update(candidate_origin='rank_supplement',candidate_strategies=[])
                 rows.extend(found)
                 if stats:self.market_stats=stats
                 if found:self.market_stats_time=found[0].get('market_time')
@@ -204,8 +265,15 @@ class Dashboard:
                 group='st' if self.is_st(r['symbol'],r['name']) else 'pending'
                 r['risk_group']=group;r['market']=symbol_market(r['symbol'])
                 r['eligible']=False;r['eligibility_reason']='等待日线、流动性与交易状态核验'
-                if r['symbol'] not in unique:unique[r['symbol']]=r
+                self.merge_candidate(unique,r)
             if unique:
+                if force_strategy:
+                    # A manual full-universe refresh starts a clean research pool. Real/simulated
+                    # holdings and explicit manual watches remain protected by allocate_monitoring.
+                    self.store.set('selection_pool',{})
+                    current_symbols=set(unique)
+                    self.selection=[r for r in self.selection if r.get('symbol') in current_symbols]
+                    self.store.event('selection',{'message':'已重新运行全市场策略筛选，盘前候选池不沿用上一轮结果'})
                 self.candidates=list(unique.values())
                 # Stable monitoring slots: do not silently evict a user-selected stock on rank changes.
                 old_watch=list(self.watch)
@@ -235,8 +303,9 @@ class Dashboard:
         today=str(local_date(now(),'CN'))
         saved=self.store.get('selection_pool',{})
         retained=saved.get('rows',[]) if saved.get('date')==today else []
-        # Auction ranking resets must not silently discard the morning's researched candidates.
-        preferred={r['symbol'] for r in self.selection if r['decision']=='重点观察'} | set(self.tracked())
+        # Keep tracked names and a small continuity set, while leaving most slots for today's strategy screen.
+        continuity=[r['symbol'] for r in self.selection if r['decision']=='重点观察'][:8]
+        preferred=set(continuity) | set(self.tracked())
         rows=candidate_pool([r for r in self.candidates if r.get('market')=='CN'],[r for r in retained if r.get('market')=='CN'],preferred)
         rows += [r for r in self.candidates if r.get('market')=='US'][:40]
         self.store.set('selection_pool',{'date':today,'rows':rows})
@@ -263,11 +332,12 @@ class Dashboard:
                     if cached and cached.get('fetched_date')==str(local_date(now(),symbol_market(row['symbol']))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
                         daily=[Bar.load(b) for b in cached['bars']]
                     else:
-                        daily=await self.lb.bars(row['symbol'],'day',DAILY_FETCH_COUNT)
+                        daily=await self.lb.bars(row['symbol'],'day',DAILY_FETCH_COUNT,force_cli=True)
                         daily=[b for b in daily if local_date(b.start,symbol_market(row['symbol']))<local_date(now(),symbol_market(row['symbol']))]
                         self.store.set(key,{'fetched_date':str(local_date(now(),symbol_market(row['symbol']))),'bars':[b.dump() for b in daily]})
                     if reference and reference.get('total_shares') and daily:row['market_cap']=daily[-1].close*reference['total_shares']
                     item=evaluate_selection(row,daily)
+                    item.update(candidate_origin=row.get('candidate_origin','retained'),candidate_strategies=row.get('candidate_strategies',[]))
                     f=daily_factors(row['symbol'],daily,self.benchmark_daily.get(symbol_market(row['symbol']),[]))
                     item.update(relative_strength=f.get('relative_strength'),research_reason=f['reason'])
                     if not f.get('eligible') and item['decision']=='重点观察':item.update(decision='等确认',reason=f['reason'])
@@ -280,8 +350,8 @@ class Dashboard:
                 processed.add(row['symbol'])
                 self.selection_progress['done']+=1
                 visible=results+[r for symbol,r in previous.items() if symbol in target and symbol not in processed]
-                self.selection=sorted(visible,key=lambda r:({'重点观察':0,'等确认':1,'暂不参与':2}[r['decision']],-r['score'],abs(r['distance_to_high_pct'])))
-                self.broadcast()
+                self.selection=sorted(visible,key=selection_rank)
+                if self.selection_progress['done']%10==0 or self.selection_progress['done']==self.selection_progress['total']:self.broadcast()
                 await asyncio.sleep(.1)
             for market in ['CN','US']:
                 ranked=sorted([r for r in results if r.get('market')==market and r.get('relative_strength') is not None],key=lambda r:r['relative_strength'])
@@ -290,7 +360,7 @@ class Dashboard:
                     item['rs_percentile']=100. if coverage==1 else round(index/(coverage-1)*100,1)
                     item['rs_rank_coverage']=coverage
                     self.strategies.set_relative_rank(item['symbol'],item['rs_percentile'],coverage)
-            self.selection=sorted(results,key=lambda r:({'重点观察':0,'等确认':1,'暂不参与':2}[r['decision']],-r['score'],abs(r['distance_to_high_pct'])))
+            self.selection=sorted(results,key=selection_rank)
             self.store.set('selection',self.selection);self.store.set('selection_updated',now().isoformat())
             by_symbol={r['symbol']:r for r in rows}
             self.store.set('selection_pool',{'date':today,'rows':[by_symbol[r['symbol']] for r in self.selection]})
@@ -522,6 +592,8 @@ class Dashboard:
             r['market']=symbol_market(s)
         real_symbols=self.real.symbols();tracked=set(self.tracked())
         alerts=self.alerts.list(30);simulation=self.sim.summary()
+        research_pool=self.store.get('selection_pool',{}).get('rows',[])
+        strategy_screen=self.store.get('strategy_candidate_screen',{})
         workspaces={m:self.market_workspace(m,rows,simulation,alerts) for m in ['CN','US']}
         return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 4.0','settings':self.settings,
                 'decisions':self.decisions,'exit_plans':self.exit_plans,'real_holdings':self.real.list(),'real_plans':self.real_plans,
@@ -532,7 +604,15 @@ class Dashboard:
                 'daily_reports':self.store.get('daily_reports',[])[:10],
                 'markets':{m:{'open':is_open(now(),m),'phase':phase(now(),m)} for m in ['CN','US']},
                 'calendar_valid_until':'2026-12-31','candidates':list(rows.values()),'watch':self.tracked(),
-                'coverage':{'returned_candidates':len(self.candidates),'monitored':len(self.tracked()),'ready':sum(bool(v.get('ready')) for s,v in self.validation.items() if s in self.tracked()),'last_scan':self.last_scan,'full_market':False},
+                'coverage':{'returned_candidates':len(self.candidates),
+                    'candidates_by_market':{m:sum(symbol_market(r['symbol'])==m for r in self.candidates) for m in ['CN','US']},
+                    'strategy_candidates_by_market':{m:sum(symbol_market(r['symbol'])==m and bool(r.get('candidate_strategies')) for r in self.candidates) for m in ['CN','US']},
+                    'supplement_candidates_by_market':{m:sum(symbol_market(r['symbol'])==m and not r.get('candidate_strategies') for r in self.candidates) for m in ['CN','US']},
+                    'research_pool_by_market':{m:sum(symbol_market(r['symbol'])==m for r in research_pool) for m in ['CN','US']},
+                    'selection_by_market':{m:sum(r.get('market')==m for r in self.selection) for m in ['CN','US']},
+                    'monitored':len(self.tracked()),'ready':sum(bool(v.get('ready')) for s,v in self.validation.items() if s in self.tracked()),
+                    'last_scan':self.last_scan,'full_market':False,'strategy_universe':'A股全市场','scope_label':'灵犀全市场策略初筛，本地仅复核返回候选',
+                    'strategy_screen':{k:strategy_screen.get(k) for k in ['updated_at','queries','errors']}},
                 'providers':{k:dict(v.status,auth_url=self.lb.auth_url if k=='longbridge' else None) for k,v in self.providers.items()},
                 'scanning':self.scanning,'market_stats':self.market_stats,'market_stats_time':self.market_stats_time,
                 'selection':self.selection,'selection_running':self.selection_running,'selection_progress':self.selection_progress,
@@ -1201,7 +1281,7 @@ class Dashboard:
             else:target=cal.date_to_session(str(current),direction='next').date()
         except Exception:target=current
         rows=[dict(r) for r in self.selection if r.get('market')==market and r.get('decision')!='暂不参与']
-        rows.sort(key=lambda r:({'重点观察':0,'等确认':1}.get(r.get('decision'),2),-r.get('score',0),abs(r.get('distance_to_high_pct',999))))
+        rows.sort(key=selection_rank)
         result=[]
         for index,row in enumerate(rows[:10],1):
             result.append({**row,'rank':index,'trade_date':str(target),'entry_status':'等待盘中确认',
@@ -1434,7 +1514,7 @@ class Dashboard:
                     if (not f.get('eligible') or not r.get('name_verified')) and r['decision']=='重点观察':
                         r.update(decision='等确认',reason=f['reason'] if not f.get('eligible') else '证券名称和风险标记待核验')
                 r.update(relative_strength=f.get('relative_strength'),research_reason=f['reason'])
-        self.selection.sort(key=lambda r:({'重点观察':0,'等确认':1,'暂不参与':2}[r['decision']],-r['score'],abs(r['distance_to_high_pct'])))
+        self.selection.sort(key=selection_rank)
         self.store.set('selection',self.selection)
         self.store.set('selection_updated',now().isoformat())
         self.allocate_monitoring()

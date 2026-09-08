@@ -4,6 +4,9 @@ from .models import symbol_market
 
 VERSION='选股 1.0'
 
+def ranking_key(row):
+    return ({'重点观察':0,'等确认':1,'暂不参与':2}[row['decision']],0 if row.get('candidate_strategies') else 1,-row['score'],abs(row['distance_to_high_pct']))
+
 def _ema(values,period):
     alpha=2/(period+1);result=values[0]
     for value in values[1:]:result=alpha*value+(1-alpha)*result
@@ -19,7 +22,9 @@ def _rsi(values,period=14):
     return 100. if loss==0 and gain else 50. if loss==0 else 100-100/(1+gain/loss)
 
 def candidate_pool(current,retained,preferred,limit=80):
-    ordered=[r for r in retained if r['symbol'] in preferred]+retained[:20]+current+retained
+    strategy=[r for r in current if r.get('candidate_strategies')]
+    supplement=[r for r in current if not r.get('candidate_strategies')]
+    ordered=[r for r in retained if r['symbol'] in preferred]+strategy+retained[:20]+supplement+retained
     unique={}
     for row in ordered:unique.setdefault(row['symbol'],row)
     return list(unique.values())[:limit]

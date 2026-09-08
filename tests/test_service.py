@@ -44,6 +44,39 @@ def test_source_query_text_preserved_and_scope_filtered(tmp_path):
     assert [x['symbol'] for x in r['candidates']]==['300300.SZ','600001.SH']
     assert '20260904' in r['text']
 
+def test_strategy_candidate_screen_merges_strategy_matches_and_uses_daily_cache(tmp_path):
+    d=Dashboard(tmp_path)
+    d.security_map={s:{'name':s,'证券类型':'1'} for s in ['600001.SH','300300.SZ']}
+    calls=[]
+    async def result(mode,query):
+        calls.append((mode,query))
+        extra='300300.SZ' if 'RSI14' in query else ''
+        return {'text':f'600001.SH {extra}'}
+    d.lingxi.call=result
+    first,status=asyncio.run(d.strategy_candidate_scan())
+    second,_=asyncio.run(d.strategy_candidate_scan())
+    by_symbol={row['symbol']:row for row in first}
+    assert len(calls)==4 and second==first and not status['errors']
+    assert set(by_symbol['600001.SH']['candidate_strategies'])=={'breakout','pullback','trend_pullback','trend_rsi_pullback','volatility_breakout','vcp_swing'}
+    assert by_symbol['300300.SZ']['candidate_strategies']==['trend_rsi_pullback']
+    assert all(row['candidate_origin']=='strategy' for row in first)
+
+def test_manual_full_market_scan_discards_previous_candidate_pool(tmp_path):
+    d=Dashboard(tmp_path)
+    d.security_map={'600001.SH':{'name':'新候选','证券类型':'1'}}
+    d.selection=[{'symbol':'000001.SZ','market':'CN','decision':'重点观察','score':90,'distance_to_high_pct':0}]
+    d.store.set('selection_pool',{'date':'2026-09-09','rows':[{'symbol':'000001.SZ'}]})
+    async def strategy(force=False):
+        assert force
+        return [{'symbol':'600001.SH','name':'新候选','source':'lingxi','candidate_strategies':['breakout']}],{}
+    async def rank(order):return [],{}
+    async def us_scan(market):return {'items':[]}
+    d.strategy_candidate_scan=strategy;d.lingxi.rank=rank;d.lb.cli_scan=us_scan;d.schedule_selection=lambda:None
+    asyncio.run(d.scan(force_strategy=True))
+    assert d.store.get('selection_pool')=={}
+    assert not d.selection
+    assert [row['symbol'] for row in d.candidates]==['600001.SH']
+
 def test_local_api_rejects_cross_origin_and_private_files(tmp_path,monkeypatch):
     import app.main as main
     d=Dashboard(tmp_path)
@@ -53,6 +86,8 @@ def test_local_api_rejects_cross_origin_and_private_files(tmp_path,monkeypatch):
     with TestClient(main.app,base_url='http://localhost') as c:
         page=c.get('/');assert page.status_code==200
         assert "location.protocol==='file:'" in page.text
+        script=c.get('/assets/app.js');assert script.status_code==200
+        assert "action('/api/scan',{},'已开始重新筛选" in script.text
         assert "sha256-vzr6U6Yv8Vz+BRc+9/HgtZvUqecsKaEvnfervwwT014=" in page.headers['content-security-policy']
         r=c.get('/api/state');assert r.status_code==200
         assert 'apiKey' not in r.text

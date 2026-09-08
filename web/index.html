@@ -55,8 +55,9 @@
       </section>
 
       <section class="page hidden" id="premarket">
-        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>准备度用于安排观察顺序；只有完整5分钟买点和实时执行检查全部通过后，才会进入今日决策。</p></div><button class="primary" id="refresh-premarket">更新盘前筛选</button></div>
+        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>A股先由灵犀按启用策略查询全市场，再由本地日线复核；只有完整5分钟买点和实时执行检查全部通过后，才会进入今日决策。</p></div><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div>
         <div class="health-strip compact" id="premarket-summary"></div>
+        <div class="scope-note" id="premarket-scope"></div>
         <div class="screener-layout">
           <section class="panel screener-panel">
             <div class="screener-tools"><div class="search-box">⌕<input id="premarket-search" placeholder="搜索股票或代码" autocomplete="off"></div><div class="chips" id="risk-filter"><button data-risk="all" class="selected">全部</button><button data-risk="normal">普通股</button><button data-risk="smallcap">高波动</button><button data-risk="st">ST / *ST</button></div><span id="premarket-count"></span></div>
