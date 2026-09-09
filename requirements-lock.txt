@@ -18,7 +18,7 @@ longbridge==4.5.0
 nest-asyncio==1.6.0
 numpy==2.2.6
 packaging==26.3
-pandas==2.3.3
+pandas==3.0.5
 pluggy==1.6.0
 pydantic==2.13.5
 pydantic_core==2.46.5
