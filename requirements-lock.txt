@@ -33,5 +33,5 @@ tomli==2.4.1
 toolz==1.1.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
-tzdata==2025.3
+tzdata==2026.3
 uvicorn==0.52.4
