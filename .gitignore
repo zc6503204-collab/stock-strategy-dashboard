@@ -2,6 +2,8 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.playwright-cli/
+output/
 *.pyc
 .DS_Store
 .env
