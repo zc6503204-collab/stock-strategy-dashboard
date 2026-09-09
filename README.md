@@ -1,5 +1,19 @@
 # 短线＋波段观察台 · 工作台 4.0 / 多策略实验
 
+一个在本机运行的A股与美股策略研究、模拟交易和持仓提醒工作台。程序将可解释的盘前筛选、完整5分钟K线确认、统一风险检查和分策略复盘连接起来。券商接口保持只读，程序不自动下单，也不在日常盯盘中调用AI。
+
+## 快速开始
+
+```sh
+git clone https://github.com/zc6503204-collab/stock-strategy-dashboard.git
+cd stock-strategy-dashboard
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+./start.command
+```
+
+行情能力取决于你自己的数据订阅。长桥通过页面完成本机OAuth授权；盈透通过本机TWS或IB Gateway只读连接；灵犀组件可运行 `python3 scripts/install_lingxi.py` 安装，之后将你自己的 `gtht-entry.json` 放入安装脚本创建的 `.local/vendor/gtht/gtht-skill-shared/`。项目不附带、上传或共享任何凭证和供应商数据。
+
 本机网页：**http://127.0.0.1:8765/**。双击 `start.command` 打开。日常行情、判断、通知和收盘摘要由本机程序完成，不运行Codex周期任务，不调用AI模型；开发或主动要求AI解读仍使用相应额度。行情请求遵守现有订阅和接口限额。
 
 ## 双市场工作区
@@ -91,7 +105,7 @@ VWAP按同源5分钟典型价格 `(最高+最低+收盘)/3` 与成交量加权�
 
 ## 维护
 
-凭证留在 `.local` 私有目录，只由后台读取，静态服务仅开放 `web/`。所有写接口要求本机来源标记；不实现真实订单接口。数据库保存K线、原始信号、决策变化、模拟交易、通知和收盘报告。升级前备份在 `.local/backups`。
+凭证留在 `.local` 私有目录，只由后台读取，静态服务仅开放 `web/`。所有写接口要求本机来源标记；不实现真实订单接口。数据库保存K线、原始信号、决策变化、模拟交易、通知和收盘报告。升级前备份在 `.local/backups`。公开、复制或打包前请阅读 [`SECURITY.md`](SECURITY.md)，并运行 `python3 scripts/check_no_secrets.py --history`；不要发布整个工作目录。
 
 ```sh
 .venv/bin/python -m pytest -q
@@ -105,5 +119,7 @@ node --check web/app.js
 真实持仓接口：`POST /api/real-holdings/manual`、`POST /api/real-holdings/plan`、`POST /api/real-holdings/remove`、`POST /api/real-holdings/sync`。原候选、模拟、连接与提醒接口兼容保留。
 
 第三方开源项目的取舍与本地落地映射见 [`docs/GITHUB_RESEARCH.md`](docs/GITHUB_RESEARCH.md)。本项目吸收流程和验证方法，没有把外部项目的LLM结论或自动交易代码接入日常盯盘。
+
+项目采用 [MIT License](LICENSE)。供应商SDK、运行时下载的灵犀组件和行情数据仍分别受其自身条款约束，不随本仓库重新授权或分发。贡献说明见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 研究依据：[AQR动量研究](https://www.aqr.com/insights/research/journal-article/fact-fiction-and-momentum-investing)、[开盘区间突破研究](https://concretumgroup.com/wp-content/uploads/2026/02/A-Profitable-Day-Trading-Strategy-For-The-U.S.-Equity-Market.pdf)、[FINRA止损说明](https://www.finra.org/investors/insights/stop-orders-factors-consider-during-volatile-markets)。灵犀提供客观行情，本地策略及模拟结果不代表国泰海通投资建议。
