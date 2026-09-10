@@ -112,6 +112,10 @@ class Dashboard:
                 active=any(is_open(now(),m) for m in ['CN','US'])
                 quote_window=active or phase(now(),'CN')=='集合竞价'
                 preparing=[m for m in ['CN','US'] if monitoring_window(now(),m)]
+                # Rotate automatic candidates into the shared monitoring capacity as soon as
+                # a market enters its preparation window. Protected holdings/manual watches
+                # keep their priority; this avoids waiting for a long daily-selection pass.
+                if preparing:self.allocate_monitoring()
                 if self.ib_auto_connect and tick-self.last_ib_attempt>30 and (not self.ib.ib or not self.ib.ib.isConnected()):
                     self.last_ib_attempt=tick
                     if not self.ib_connect_task or self.ib_connect_task.done():
@@ -133,9 +137,7 @@ class Dashboard:
                     marker=self.store.get('premarket_scan_marker',{})
                     due=[m for m in preparing if marker.get(m)!=str(local_date(now(),m))]
                     if due and not self.scanning:
-                        marker.update({m:str(local_date(now(),m)) for m in due})
-                        self.store.set('premarket_scan_marker',marker)
-                        task=asyncio.create_task(self.scan());self.tasks.append(task)
+                        task=asyncio.create_task(self.run_premarket_scan(due));self.tasks.append(task)
                 if self.first_poll or any(s not in self.details for s in self.tracked()) or (active and tick-self.last_bars_cycle>60):
                     await self.refresh_bars();self.last_bars_cycle=time.monotonic()
                     if self.lb.ctx:
@@ -148,6 +150,14 @@ class Dashboard:
                 self.store.event('system',{'message':'数据刷新未完成，已暂停本轮新信号','error_type':type(exc).__name__})
             self.last_cycle=time.monotonic()
             await asyncio.sleep(5)
+
+    async def run_premarket_scan(self,markets):
+        """Run one fresh scan per market session, then persist successful completion."""
+        await self.scan(force_strategy='CN' in markets)
+        marker=self.store.get('premarket_scan_marker',{})
+        marker.update({market:str(local_date(now(),market)) for market in markets})
+        self.store.set('premarket_scan_marker',marker)
+        self.broadcast()
 
     async def connect_ib_available(self):
         for port in dict.fromkeys([self.settings['ib_port'],4001,4002,7496,7497]):
@@ -1140,6 +1150,43 @@ class Dashboard:
         fresh=sum(fresh_quote(self.quotes.get(s),now()) for s in tracked)
         uncovered=sum(s not in tracked for s in self.real.symbols() if suffix(s))
         current_time=now();open_now=is_open(current_time,market);market_phase=phase(current_time,market)
+        session_day=local_date(current_time,market)
+        evaluated=[]
+        for symbol in tracked:
+            last_bar=self.details.get(symbol,{}).get('last_bar')
+            if (self.validation.get(symbol,{}).get('ready') and last_bar
+                    and local_date(stamp(last_bar),market)==session_day):
+                evaluated.append(symbol)
+        today_signals=[row for row in self.store.signals()
+                       if suffix(row['symbol']) and local_date(stamp(row['time']),market)==session_day]
+        today_failures=[row for row in self.sim.state['failures']
+                        if suffix(row.get('symbol','')) and local_date(stamp(row['time']),market)==session_day]
+        wait_counts={}
+        for symbol in evaluated:
+            reason=self.details.get(symbol,{}).get('preview',{}).get('reason')
+            if reason:wait_counts[reason]=wait_counts.get(reason,0)+1
+        wait_summary=[{'reason':reason,'count':count} for reason,count in
+                      sorted(wait_counts.items(),key=lambda item:(-item[1],item[0]))[:3]]
+        market_selection=sum(r.get('market')==market for r in self.selection)
+        scan_running=bool(self.scanning or self.selection_running)
+        if primary:
+            session_conclusion=f'当前{len(buys)}只通过买点与执行检查'
+        elif urgent:
+            session_conclusion='已发现真实持仓需要先处理'
+        elif evaluated:
+            prefix='上午盘' if market_phase=='午间休市' else '今日' if market_phase=='已收盘' else '本轮'
+            session_conclusion=f'{prefix}已检查{len(evaluated)}只，{len(today_signals)}只触发过策略信号，当前0只通过全部买入检查'
+        elif scan_running:
+            session_conclusion='正在自动筛选和预热，尚未形成本轮盘中结论'
+        elif premarket:
+            session_conclusion=f'已选出{len(premarket)}只盘前观察股，等待本交易日完整五分钟K线'
+        else:
+            session_conclusion='当前没有可用的盘前观察名单'
+        if not urgent and not primary:
+            if market_phase=='午间休市' and evaluated:headline='上午盘结论：暂不买'
+            elif open_now and scan_running:headline='自动复核中，当前暂不买'
+            elif open_now:headline='本轮结论：暂不买'
+            elif market_phase=='已收盘' and evaluated:headline='今日结论：无可执行买点'
         transport,transport_label,subscription_count=self.market_transport(market,tracked,ready)
         quote_age=(current_time-latest).total_seconds() if latest else None
         if not self.monitor_running:health_state='paused';health_text='盯盘已暂停'
@@ -1175,7 +1222,13 @@ class Dashboard:
                       'active_subscriptions':subscription_count,'monitor_limit':self.settings['monitor_limit'],
                       'phase_reason':health_text},
             'decision':{'status':status,'headline':headline,'primary':primary,'backups':backups,'watching':watching,
-                        'reason':'有持仓退出条件需要先处理' if urgent else '买点已通过完整K线、现价、盘口与资金检查' if primary else '尚无股票同时通过盘中触发、实时行情、盘口和风险检查'},
+                        'reason':'有持仓退出条件需要先处理' if urgent else '买点已通过完整K线、现价、盘口与资金检查' if primary else session_conclusion,
+                        'session_summary':{'state':'complete' if evaluated else 'running' if scan_running else 'waiting',
+                            'refreshing':scan_running,
+                            'candidate_count':market_selection,'premarket_count':len(premarket),'monitored_count':len(tracked),
+                            'evaluated_count':len(evaluated),'signals_today':len(today_signals),'buyable_now':len(buys),
+                            'failed_fills_today':len(today_failures),'wait_reasons':wait_summary,
+                            'scan_progress':dict(self.selection_progress),'last_scan':self.last_scan}},
             'premarket':premarket,'candidates':candidates,
             'holdings':{'real':real,'paper':paper,'actionable':actionable[:6]},
             'alerts':market_alerts,'simulation':dict(simulation[market],shadow=self.sim.shadow_summary(market).get(market,{})),

@@ -77,6 +77,15 @@ def test_strategy_candidate_screen_merges_strategy_matches_and_uses_daily_cache(
     assert by_symbol['300300.SZ']['candidate_strategies']==['trend_rsi_pullback']
     assert all(row['candidate_origin']=='strategy' for row in first)
 
+def test_cn_premarket_scan_forces_fresh_strategy_screen_before_marking_done(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);fixed=stamp('2026-09-10T01:05:00Z')
+    monkeypatch.setattr('app.service.now',lambda:fixed);calls=[]
+    async def scan(force_strategy=False):calls.append(force_strategy)
+    d.scan=scan
+    asyncio.run(d.run_premarket_scan(['CN']))
+    assert calls==[True]
+    assert d.store.get('premarket_scan_marker')['CN']=='2026-09-10'
+
 def test_manual_full_market_scan_discards_previous_candidate_pool(tmp_path):
     d=Dashboard(tmp_path)
     d.security_map={'600001.SH':{'name':'新候选','证券类型':'1'}}

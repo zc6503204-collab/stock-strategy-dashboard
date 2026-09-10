@@ -59,16 +59,17 @@ function healthStrip(w){const h=w.health,age=w.meta.open&&h.quote_age_seconds!=n
 function renderToday(){
   const w=workspace(),d=w.decision,h=w.health;
   $('#health-strip').innerHTML=healthStrip(w);
-  const statusText=d.status==='BUY'?'可以买入观察':d.status==='MANAGE'?'先处理持仓':'今天暂不买';
-  $('#decision-hero').innerHTML=`<div><span class="kicker">${esc(w.meta.name)} · ${esc(w.meta.phase)}</span><div class="decision-word">${esc(d.headline)}</div><p>${esc(d.reason)}</p></div><span class="decision-mark ${d.status==='MANAGE'?'manage':''}">${statusText}</span>`;
+  const s=d.session_summary||{},statusText=d.status==='BUY'?'当前可买':d.status==='MANAGE'?'先处理持仓':s.state==='running'?'自动扫描中':'本轮无买点';
+  const progress=s.refreshing&&s.scan_progress?.total?` · 日线复核 ${s.scan_progress.done}/${s.scan_progress.total}`:'';
+  $('#decision-hero').innerHTML=`<div><span class="kicker">${esc(w.meta.name)} · ${esc(w.meta.phase)}</span><div class="decision-word">${esc(d.headline)}</div><p>${esc(d.reason)}</p><div class="decision-facts"><span>盘前 ${num(s.premarket_count??0,0)}只</span><span>盘中监测 ${num(s.monitored_count??0,0)}只</span><span>已检查 ${num(s.evaluated_count??0,0)}只</span><span>今日信号 ${num(s.signals_today??0,0)}只</span><span>当前可买 ${num(s.buyable_now??0,0)}只${esc(progress)}</span></div></div><span class="decision-mark ${d.status==='MANAGE'?'manage':''}">${statusText}</span>`;
   $('#primary-decision').innerHTML=d.primary?primaryCard(d.primary,w):emptyPrimary(d,w);
   const slots=[...d.backups.map(row=>({...row,slotType:'buy'})),...d.watching.filter(row=>!d.backups.some(item=>item.symbol===row.symbol)).map(row=>({...row,slotType:'watch'}))].slice(0,2);
   while(slots.length<2)slots.push(null);
   $('#backup-decisions').innerHTML=slots.map((row,index)=>row?backupCard(row,index+1):`<div class="empty-backup"><b>备选 ${index+1} · 暂无</b><p>还没有更多股票通过盘前筛选与风险约束。</p></div>`).join('');
   const actions=w.holdings.actionable.filter(row=>row.holding_type==='real');
   $('#holding-actions').innerHTML=actions.length?actions.slice(0,4).map(holdingActionRow).join(''):`<div class="empty">当前没有需要立即处理的真实持仓。<br><small>${w.holdings.real.length?`本市场共${w.holdings.real.length}只真实持仓，完整列表在持仓管理。`:'尚未录入或同步本市场真实持仓。'}</small></div>`;
-  const reasons=[...h.issues,d.reason];if(!d.primary&&d.watching[0])reasons.push(`${d.watching[0].name}：${d.watching[0].reason}`);
-  $('#waiting-reasons').innerHTML=[...new Set(reasons.filter(Boolean))].slice(0,4).map((reason,index)=>`<div class="list-row"><div><b>${index===0?'当前结论':'仍需满足'}</b></div><div>${esc(reason)}</div><span class="action-chip">等待</span></div>`).join('')||'<div class="empty">当前条件完整。</div>';
+  const scanReasons=(s.wait_reasons||[]).map(row=>`${row.count}只：${row.reason}`),reasons=[...h.issues,...scanReasons];if(!reasons.length&&!d.primary)reasons.push(d.reason);if(!d.primary&&d.watching[0]&&!scanReasons.length)reasons.push(`${d.watching[0].name}：${d.watching[0].reason}`);
+  $('#waiting-reasons').innerHTML=[...new Set(reasons.filter(Boolean))].slice(0,4).map((reason,index)=>`<div class="list-row"><div><b>${index===0?'主要原因':'其他原因'}</b></div><div>${esc(reason)}</div><span class="action-chip">未通过</span></div>`).join('')||'<div class="empty">当前条件完整。</div>';
   $('#market-alerts').innerHTML=w.alerts.length?w.alerts.slice(0,6).map(alertRow).join(''):'<div class="empty">当前市场暂无提醒。</div>';
 }
 function emptyPrimary(d,w){return `<div class="empty-primary"><div><div class="empty-icon">○</div><h2>${esc(d.headline)}</h2><p>${esc(d.reason)}。盘前名单仍会继续观察，但不会为了填满推荐位而显示买入。</p><button class="secondary" data-go="premarket">查看${esc(w.meta.name)}观察名单</button></div></div>`}

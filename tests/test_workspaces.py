@@ -102,3 +102,22 @@ def test_lunch_health_keeps_last_quote_without_reporting_feed_failure(tmp_path,m
     assert health['last_quote_at'] and health['last_bar_at']
     assert health['active_subscriptions']==1 and health['monitor_limit']==12
     assert health['quote_age_seconds']==1800
+
+
+def test_workspace_reports_completed_session_check_instead_of_generic_wait(tmp_path,monkeypatch):
+    fixed=datetime(2026,9,10,2,10,tzinfo=timezone.utc)  # 10:10 Beijing time.
+    monkeypatch.setattr('app.service.now',lambda:fixed)
+    dashboard=Dashboard(tmp_path);symbol='600001.SH'
+    dashboard.selection=[_selection(symbol,'CN',1)];dashboard.watch=[symbol]
+    dashboard.validation[symbol]={'ready':True,'eligible':True,'source':'longbridge'}
+    dashboard.details[symbol]={'last_bar':(fixed-timedelta(minutes=5)).isoformat(),
+                               'preview':{'reason':'等待开盘区间突破'}}
+    dashboard.quotes[symbol]=Quote(symbol,'longbridge','样本',10,fixed-timedelta(seconds=5),fixed,
+                                   quality='realtime',session='regular',trade_status='Normal')
+    decision=dashboard.snapshot()['workspaces']['CN']['decision']
+    assert decision['headline']=='本轮结论：暂不买'
+    assert decision['session_summary']['state']=='complete'
+    assert decision['session_summary']['evaluated_count']==1
+    assert decision['session_summary']['signals_today']==0
+    assert '已检查1只' in decision['reason']
+    assert decision['session_summary']['wait_reasons']==[{'reason':'等待开盘区间突破','count':1}]
