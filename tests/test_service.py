@@ -2,7 +2,7 @@ import asyncio
 from datetime import timedelta
 from fastapi.testclient import TestClient
 from app.service import Dashboard
-from app.models import Quote,now
+from app.models import Bar,Quote,now,stamp
 from test_engine import bar,breakout_bars
 
 def test_feed_gap_cancels_entry_and_cross_source_is_ignored(tmp_path,monkeypatch):
@@ -34,6 +34,22 @@ def test_out_of_order_quote_does_not_overwrite(tmp_path):
     q=Quote('AAPL.US','lingxi','Apple',100,t,t);d.accept_quote(q)
     old=Quote('AAPL.US','lingxi','Apple',90,t-timedelta(seconds=10),t);d.accept_quote(old)
     assert d.quotes['AAPL.US'].price==100
+
+def test_lunch_reconnect_refreshes_intraday_benchmark(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path)
+    midday=stamp('2026-09-10T04:00:00Z')
+    monkeypatch.setattr('app.service.now',lambda:midday)
+    d.watch=['002839.SZ'];d.validation['002839.SZ']={'ready':True,'source':'longbridge'}
+    d.lb.ctx=object();requested=[];received=[]
+    async def quotes(symbols):return []
+    async def bars(symbol,*args,**kwargs):
+        requested.append(symbol)
+        return [Bar(symbol,'longbridge',stamp('2026-09-10T03:25:00Z'),100,101,99,100,1000,100000)]
+    d.lb.quotes=quotes;d.lb.bars=bars
+    d.strategies.set_benchmark=lambda market,rows:received.append((market,rows))
+    asyncio.run(d.refresh_live())
+    assert requested==['000300.SH']
+    assert received and received[0][0]=='CN' and received[0][1][0].symbol=='000300.SH'
 
 def test_source_query_text_preserved_and_scope_filtered(tmp_path):
     d=Dashboard(tmp_path)

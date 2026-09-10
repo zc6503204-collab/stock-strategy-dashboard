@@ -1420,12 +1420,19 @@ class Dashboard:
                         if q and q.source==book['source']:
                             for k in ['bid','ask','bid_size','ask_size','depth_time']:setattr(q,k,book[k])
                 except Exception:pass
+            # Rebuild the benchmark whenever this market is inside its monitoring
+            # window. This also covers an A-share lunch-break wake/reconnect: the
+            # stock history may already include the 11:25 bar while the in-memory
+            # benchmark still stops before sleep. Waiting for 13:00 would make all
+            # candidates look unsynchronised even though the data feed is healthy.
+            active_markets={symbol_market(symbol) for symbol in active}
             for market in ['CN','US']:
-                if is_open(now(),market):
+                if market in active_markets:
                     try:
                         bars=await self.lb.bars(BENCHMARKS[market])
                         self.strategies.set_benchmark(market,[b for b in bars if b.final and b.end<=now()])
-                    except Exception:pass
+                    except Exception as exc:
+                        self.store.event('monitor',{'message':f'{market}基准K线暂未补齐，等待重试','error_type':type(exc).__name__})
             self.evaluate_decisions();self.runtime_ok=now().isoformat()
         except Exception as exc:self.store.event('monitor',{'message':'行情轮询暂未完成，等待重试','error_type':type(exc).__name__})
 
