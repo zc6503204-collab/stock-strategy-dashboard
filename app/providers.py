@@ -85,6 +85,8 @@ class Provider:
         self.status.update(state='connected',message=message,last_ok=now().isoformat(),latency_ms=round(elapsed*1000),authorized=True)
     def fail(self,message='连接暂不可用'):
         self.status.update(state='unavailable',message=message)
+    async def account_summary(self):
+        raise RuntimeError('该数据源未提供账户摘要')
 
 class Lingxi(Provider):
     name='lingxi'
@@ -124,12 +126,13 @@ class Longbridge(Provider):
     def __init__(self):
         super().__init__();self.ctx=None;self.auth_url=None;self.auth_running=False
         self.loop=None;self.on_quote=None;self.on_bar=None;self.subscribed=set();self.auth_thread=None
-        self.units={};self.exchanges={};self.quote_meta={};self.status.update(state='auth_required',message='SDK持续行情需要授权；可先读取现有CLI数据')
+        self.units={};self.exchanges={};self.quote_meta={};self.last_push_dispatch={}
+        self.status.update(state='auth_required',message='SDK持续行情需要授权；可先读取现有CLI数据')
 
-    async def cli_scan(self,market):
+    async def cli_scan(self,market,count=80):
         async with self.lock:
             # CLI indicator metadata defines marketcap in 100-million currency units.
-            return await command('longbridge','screener','filter','prevclose:2:','marketcap:0.5:','--market',market,'--count','40','--format','json',timeout=25)
+            return await command('longbridge','screener','filter','prevclose:2:','marketcap:0.5:','--market',market,'--count',str(count),'--format','json',timeout=25)
 
     async def account_positions(self):
         """Read current long stock positions through the installed CLI."""
@@ -146,6 +149,48 @@ class Longbridge(Provider):
             result.append({'symbol':symbol,'name':row.get('name') or symbol,'quantity':quantity,
                            'available':number(row.get('available')),'cost':cost,'currency':row.get('currency')})
         return result
+
+    async def account_summary(self):
+        """Return an allow-listed account summary; raw account identifiers never leave this adapter."""
+        async with self.lock:
+            raw=await command('longbridge','assets','--format','json',timeout=20)
+        rows=raw if isinstance(raw,list) else raw.get('accounts',raw.get('items',[raw])) if isinstance(raw,dict) else []
+        balances=[]
+        aliases={
+            'net_assets':('net_assets','net_asset','total_assets','net_liquidation'),
+            'cash':('cash','cash_balance','total_cash','cash_amount'),
+            'buying_power':('buy_power','buying_power'),
+            'available_funds':('available_cash','available_funds','withdraw_cash'),
+            'initial_margin':('initial_margin','init_margin','init_margin_req'),
+            'maintenance_margin':('maintenance_margin','maint_margin_req'),
+            'excess_liquidity':('excess_liquidity',),
+            'margin_call':('margin_call',),
+        }
+        for row in rows:
+            if not isinstance(row,dict):continue
+            item={'currency':str(row.get('currency') or row.get('base_currency') or '').upper() or None}
+            for target,names in aliases.items():
+                value=next((number(row.get(name)) for name in names if number(row.get(name)) is not None),None)
+                if value is not None:item[target]=value
+            risk=row.get('risk_level')
+            if risk is not None:item['risk_level']=number(risk) if number(risk) is not None else str(risk)[:40]
+            if len(item)>1:balances.append(item)
+            for cash in row.get('cash_infos',[]) if isinstance(row.get('cash_infos'),list) else []:
+                if not isinstance(cash,dict):continue
+                detail={'currency':str(cash.get('currency') or '').upper() or None}
+                for target,names in {'cash':('cash','balance'),'available_funds':('available_cash','available'),
+                                     'withdrawable_cash':('withdrawable_cash','withdrawable'),
+                                     'frozen_cash':('frozen_cash','frozen')}.items():
+                    value=next((number(cash.get(name)) for name in names if number(cash.get(name)) is not None),None)
+                    if value is not None:detail[target]=value
+                if len(detail)>1:balances.append(detail)
+        merged={}
+        for item in balances:
+            currency=item.get('currency') or 'BASE'
+            merged.setdefault(currency,{'currency':currency}).update({k:v for k,v in item.items() if k!='currency'})
+        balances=list(merged.values())
+        if not balances:raise RuntimeError('长桥账户摘要暂不可用')
+        return {'source':'longbridge','balances':balances,'updated_at':now().isoformat()}
 
     async def reference_info(self,symbols):
         if not self.ctx:return {}
@@ -293,6 +338,12 @@ class Longbridge(Provider):
 
     def _quote(self,symbol,event):
         try:
+            # Vendor quote callbacks can arrive much faster than the dashboard can
+            # use them.  Coalesce per symbol so HTTP/UI work is never starved by a
+            # burst while preserving sub-second execution checks.
+            current=time.monotonic()
+            if current-self.last_push_dispatch.get(symbol,0)<.25:return
+            self.last_push_dispatch[symbol]=current
             meta=self.quote_meta.get(symbol,{})
             q=Quote(symbol,'longbridge',symbol,float(event.last_done),sdk_stamp(event.timestamp),now(),
                     volume=float(event.volume)*self.units.get(symbol,1),turnover=float(event.turnover),
@@ -451,6 +502,25 @@ class IBKR(Provider):
             result.append({'symbol':symbol,'name':symbol,'quantity':quantity,'available':None,
                            'cost':cost,'currency':'USD'})
         return result
+
+    async def account_summary(self):
+        """Read allow-listed values from the local read-only session and discard account identifiers."""
+        if not self.ib or not self.ib.isConnected():
+            raise RuntimeError('盈透本地接口尚未连接')
+        rows=await asyncio.wait_for(self.ib.accountSummaryAsync(),8)
+        mapping={'NetLiquidation':'net_assets','TotalCashValue':'cash','BuyingPower':'buying_power',
+                 'AvailableFunds':'available_funds','InitMarginReq':'initial_margin',
+                 'MaintMarginReq':'maintenance_margin','ExcessLiquidity':'excess_liquidity','Cushion':'cushion'}
+        grouped={}
+        for row in rows:
+            key=mapping.get(str(getattr(row,'tag','')))
+            value=number(getattr(row,'value',None))
+            if not key or value is None:continue
+            currency=str(getattr(row,'currency','') or 'BASE').upper()
+            grouped.setdefault(currency,{'currency':currency})[key]=value
+        balances=list(grouped.values())
+        if not balances:raise RuntimeError('盈透账户摘要暂不可用')
+        return {'source':'ibkr','balances':balances,'updated_at':now().isoformat()}
 
     async def bars(self,symbol):
         if symbol not in self.verified:raise RuntimeError('备用源实时权限未验证')

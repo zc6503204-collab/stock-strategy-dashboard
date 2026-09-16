@@ -80,11 +80,73 @@ def test_strategy_candidate_screen_merges_strategy_matches_and_uses_daily_cache(
 def test_cn_premarket_scan_forces_fresh_strategy_screen_before_marking_done(tmp_path,monkeypatch):
     d=Dashboard(tmp_path);fixed=stamp('2026-09-10T01:05:00Z')
     monkeypatch.setattr('app.service.now',lambda:fixed);calls=[]
-    async def scan(force_strategy=False):calls.append(force_strategy)
+    async def scan(force_strategy=False,rebuild_markets=None,wait_selection=False):
+        calls.append((force_strategy,rebuild_markets,wait_selection))
+        d.daily_core['CN']={'trade_date':'2026-09-10','updated_at':fixed.isoformat(),'rows':[],'stale':False}
     d.scan=scan
     asyncio.run(d.run_premarket_scan(['CN']))
-    assert calls==[True]
+    assert calls==[(True,['CN'],True)]
     assert d.store.get('premarket_scan_marker')['CN']=='2026-09-10'
+
+def test_failed_daily_rebuild_keeps_snapshot_and_does_not_mark_complete(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);fixed=stamp('2026-09-10T01:05:00Z')
+    monkeypatch.setattr('app.service.now',lambda:fixed)
+    async def scan(force_strategy=False,rebuild_markets=None,wait_selection=False):
+        d.daily_core['CN']={'trade_date':'2026-09-09','updated_at':'2026-09-09T01:00:00Z',
+                            'rows':[{'symbol':'600001.SH'}],'stale':True}
+    d.scan=scan
+    asyncio.run(d.run_premarket_scan(['CN']))
+    assert 'CN' not in d.store.get('premarket_scan_marker',{})
+
+def test_daily_core_and_intraday_supplement_are_separate_and_industry_is_kept(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);fixed=stamp('2026-09-10T02:00:00Z')
+    monkeypatch.setattr('app.service.now',lambda:fixed)
+    d.security_map={s:{'name':s,'证券类型':'1'} for s in ['600001.SH','300001.SZ']}
+    async def strategy(force=False):
+        return [{'symbol':'600001.SH','name':'样本银行','source':'lingxi','candidate_strategies':['breakout'],
+                 'candidate_origin':'strategy'}],{'queries':[{'group':'breakout'}],'errors':[]}
+    async def cli_scan(market):
+        item={'symbol':'600001.SH','name':'样本银行','industry':'银行','prevclose':10,'prevchg':1,'marketcap':1e10} if market=='CN' else {'symbol':'AAPL.US','name':'Apple','industry':'消费电子','prevclose':200,'prevchg':1,'marketcap':3e12}
+        return {'items':[item]}
+    async def rank(order):
+        return ([{'symbol':'300001.SZ','name':'盘中样本','source':'lingxi'}],{}) if order==10 else ([],{})
+    d.strategy_candidate_scan=strategy;d.lb.cli_scan=cli_scan;d.lingxi.rank=rank;d.schedule_selection=lambda:None
+    rebuilt=asyncio.run(d.scan(force_strategy=True,rebuild_markets=['CN','US']))
+    rows={r['symbol']:r for r in d.candidates}
+    assert rebuilt=={'CN','US'} and rows['600001.SH']['industry']=='银行'
+    assert rows['600001.SH']['pool_role']=='daily_core'
+    assert rows['300001.SZ']['pool_role']=='intraday_supplement'
+    assert d.daily_core['US']['rows'][0]['industry']=='消费电子'
+
+def test_daily_core_is_capped_at_80_and_keeps_strategy_candidates_first(tmp_path):
+    d=Dashboard(tmp_path)
+    market_rows=[{'symbol':f'T{i:03}.US','name':f'市场{i}','candidate_strategies':[]} for i in range(90)]
+    strategy_rows=[{'symbol':f'S{i:03}.US','name':f'策略{i}','candidate_strategies':['breakout']} for i in range(3)]
+    rows=d.limit_core_rows(market_rows+strategy_rows)
+    assert len(rows)==80
+    assert [row['symbol'] for row in rows[:3]]==['S000.US','S001.US','S002.US']
+
+def test_saved_oversized_core_is_trimmed_when_dashboard_starts(tmp_path):
+    from app.store import Store
+    store=Store(tmp_path/'.local/dashboard.sqlite3')
+    store.set('daily_candidate_core',{'US':{'trade_date':'2026-09-15','rows':[
+        {'symbol':f'T{i:03}.US','name':f'市场{i}','candidate_strategies':[]} for i in range(81)]}})
+    dashboard=Dashboard(tmp_path)
+    assert len(dashboard.daily_core['US']['rows'])==80
+    assert len(dashboard.store.get('daily_candidate_core')['US']['rows'])==80
+
+def test_failed_core_refresh_preserves_last_valid_rows_as_stale(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);fixed=stamp('2026-09-10T02:00:00Z')
+    monkeypatch.setattr('app.service.now',lambda:fixed)
+    d.security_map={'600001.SH':{'name':'旧候选','证券类型':'1'}}
+    d.daily_core={'CN':{'trade_date':'2026-09-09','updated_at':'2026-09-09T01:00:00Z','stale':False,
+                        'rows':[{'symbol':'600001.SH','name':'旧候选','source':'lingxi','candidate_strategies':['breakout'],'pool_role':'daily_core'}]}}
+    async def unavailable(*args,**kwargs):raise RuntimeError('private detail')
+    async def rank(order):return [],{}
+    d.strategy_candidate_scan=unavailable;d.lb.cli_scan=unavailable;d.lingxi.rank=rank;d.schedule_selection=lambda:None
+    rebuilt=asyncio.run(d.scan(rebuild_markets=['CN']))
+    assert rebuilt==set() and d.daily_core['CN']['stale']
+    assert [r['symbol'] for r in d.candidates if r['market']=='CN']==['600001.SH']
 
 def test_manual_full_market_scan_discards_previous_candidate_pool(tmp_path):
     d=Dashboard(tmp_path)

@@ -4,8 +4,25 @@ from .models import symbol_market
 
 VERSION='选股 1.0'
 
+DECISION_ORDER={'重点观察':0,'等确认':1,'暂不参与':2}
+
 def ranking_key(row):
-    return ({'重点观察':0,'等确认':1,'暂不参与':2}[row['decision']],0 if row.get('candidate_strategies') else 1,-row['score'],abs(row['distance_to_high_pct']))
+    return (DECISION_ORDER[row['decision']],0 if row.get('candidate_strategies') else 1,-row['score'],abs(row['distance_to_high_pct']))
+
+def diversified_rank(rows,limit=10):
+    """Softly diversify display picks without excluding a high-scoring industry."""
+    remaining=list(rows);selected=[];industry_counts={}
+    while remaining and len(selected)<limit:
+        def key(row):
+            industry=str(row.get('industry') or '').strip()
+            count=industry_counts.get(industry,0) if industry else 0
+            penalty=4*max(0,count-1)
+            return (DECISION_ORDER[row['decision']],0 if row.get('candidate_strategies') else 1,
+                    -(row['score']-penalty),abs(row['distance_to_high_pct']))
+        best=min(remaining,key=key);remaining.remove(best);selected.append(best)
+        industry=str(best.get('industry') or '').strip()
+        if industry:industry_counts[industry]=industry_counts.get(industry,0)+1
+    return selected
 
 def _ema(values,period):
     alpha=2/(period+1);result=values[0]
@@ -60,6 +77,7 @@ def evaluate(row,bars):
     elif score>=70:decision='重点观察';reason='趋势向上且成交活跃，等待盘中完整5分钟确认'
     else:decision='等确认';reason='趋势尚可，位置或量能还需改善'
     return {'symbol':row['symbol'],'name':row['name'],'market':symbol_market(b.symbol),
+      'industry':str(row.get('industry') or '').strip() or None,
       'score':score,'decision':decision,'reason':reason,'source':b.source,
       'as_of':str(local_date(b.start,symbol_market(b.symbol))),
       'close':b.close,'previous_high':b.high,'breakout_reference':ceiling,'structure_low':stop,

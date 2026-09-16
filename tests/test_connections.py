@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime,timedelta
 from types import SimpleNamespace as Obj
 from app.models import stamp
-from app.providers import Longbridge,sdk_stamp
+from app.providers import Longbridge,IBKR,sdk_stamp
 from app.service import Dashboard
 
 def test_sdk_local_datetime_is_converted_to_utc():
@@ -63,3 +63,26 @@ def test_longbridge_verified_access_is_restored_after_service_restart(tmp_path):
     restarted=Dashboard(tmp_path)
     assert restarted.lb.status['market_access']==access
     assert restarted.lb.status['packages'][0]['description'].startswith('A-shares')
+
+
+def test_longbridge_account_summary_uses_allowlist(monkeypatch):
+    provider=Longbridge()
+    async def result(*args,**kwargs):
+        return [{'currency':'USD','net_assets':'1200','available_cash':'300','buy_power':'900',
+                 'risk_level':'safe','account_no':'SECRET','access_token':'TOKEN'}]
+    monkeypatch.setattr('app.providers.command',result)
+    summary=asyncio.run(provider.account_summary())
+    assert summary['balances']==[{'currency':'USD','net_assets':1200.0,'buying_power':900.0,'available_funds':300.0,'risk_level':'safe'}]
+    assert 'SECRET' not in str(summary) and 'TOKEN' not in str(summary)
+
+
+def test_ibkr_account_summary_discards_account_identifier():
+    provider=IBKR()
+    class FakeIB:
+        def isConnected(self):return True
+        async def accountSummaryAsync(self):
+            return [Obj(account='U123456',tag='NetLiquidation',value='1000',currency='BASE'),
+                    Obj(account='U123456',tag='AvailableFunds',value='400',currency='BASE')]
+    provider.ib=FakeIB();summary=asyncio.run(provider.account_summary())
+    assert summary['balances']==[{'currency':'BASE','net_assets':1000.0,'available_funds':400.0}]
+    assert 'U123456' not in str(summary)

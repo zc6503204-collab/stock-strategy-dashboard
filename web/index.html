@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>短线观察台 · 双市场工作区</title>
   <script>if(location.protocol==='file:')location.replace('http://127.0.0.1:8765/'+location.search+location.hash)</script>
-  <link rel="stylesheet" href="/assets/style.css">
-  <script src="/assets/app.js" defer></script>
+  <link rel="stylesheet" href="/assets/style.css?v=7">
+  <script src="/assets/app.js?v=7" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -20,6 +20,7 @@
       <button data-view="review" data-label="复盘"><span>◷</span>复盘研究</button>
       <button data-view="strategies" data-label="策略"><span>⌁</span>策略中心</button>
       <button data-view="analyze" data-label="分析"><span>◎</span>单股分析</button>
+      <button data-view="gpt" data-label="GPT"><span>✦</span>GPT 选股</button>
       <button data-view="strategy" data-label="策略"><span>⌁</span>策略说明</button>
       <button data-view="system" data-label="系统"><span>⚙</span>系统状态</button>
     </nav>
@@ -39,7 +40,7 @@
       <section class="page" id="today">
         <div class="page-title">
           <div><span class="kicker" id="today-kicker">A股 · 今日决策</span><h1 id="today-title">先看结论，再决定是否行动</h1><p id="today-subtitle">只展示当前市场的买入机会和必须处理的持仓。</p></div>
-          <button class="secondary" data-go="premarket">查看盘前名单 →</button>
+          <div class="title-actions"><button class="secondary" data-ask-gpt="market">问 GPT</button><button class="secondary" data-go="premarket">查看盘前名单 →</button></div>
         </div>
         <div class="health-strip" id="health-strip"></div>
         <section id="decision-hero" class="decision-hero"></section>
@@ -55,13 +56,13 @@
       </section>
 
       <section class="page hidden" id="premarket">
-        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>A股先由灵犀按启用策略查询全市场，再由本地日线复核；只有完整5分钟买点和实时执行检查全部通过后，才会进入今日决策。</p></div><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div>
+        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>A股先由灵犀按启用策略查询全市场，再由本地日线复核；只有完整5分钟买点和实时执行检查全部通过后，才会进入今日决策。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="scan">让 GPT 深研今日候选</button><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div></div>
         <div class="health-strip compact" id="premarket-summary"></div>
         <div class="scope-note" id="premarket-scope"></div>
         <div class="screener-layout">
           <section class="panel screener-panel">
             <div class="screener-tools"><div class="search-box">⌕<input id="premarket-search" placeholder="搜索股票或代码" autocomplete="off"></div><div class="chips" id="risk-filter"><button data-risk="all" class="selected">全部</button><button data-risk="normal">普通股</button><button data-risk="smallcap">高波动</button><button data-risk="st">ST / *ST</button></div><span id="premarket-count"></span></div>
-            <div class="table-wrap"><table class="screener-table"><thead><tr><th>排名 / 股票</th><th>准备度</th><th>日线收盘</th><th>突破观察位</th><th>保护参考</th><th>成交额</th><th>距高点</th><th>风险</th><th>等待条件</th></tr></thead><tbody id="premarket-rows"></tbody></table></div>
+            <div class="table-wrap"><table class="screener-table"><thead><tr><th>排名 / 股票</th><th>行业</th><th>准备度</th><th>日线收盘</th><th>突破观察位</th><th>保护参考</th><th>成交额</th><th>距高点</th><th>风险</th><th>等待条件</th></tr></thead><tbody id="premarket-rows"></tbody></table></div>
           </section>
           <aside class="panel stock-detail" id="stock-detail"></aside>
         </div>
@@ -70,7 +71,7 @@
       </section>
 
       <section class="page hidden" id="holdings">
-        <div class="page-title"><div><span class="kicker" id="holdings-kicker">A股 · 持仓管理</span><h1>持仓和退出计划</h1><p>真实持仓与模拟持仓分开显示；所有真实交易仍由你自行决定和下单。</p></div><div class="title-actions"><button class="secondary" id="sync-holdings">同步券商持仓</button><button class="primary" id="add-holding">＋ 手工录入</button></div></div>
+        <div class="page-title"><div><span class="kicker" id="holdings-kicker">A股 · 持仓管理</span><h1>持仓和退出计划</h1><p>真实持仓与模拟持仓分开显示；所有真实交易仍由你自行决定和下单。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="account">持仓复盘问 GPT</button><button class="secondary" id="sync-holdings">同步券商持仓</button><button class="primary" id="add-holding">＋ 手工录入</button></div></div>
         <div class="health-strip compact" id="holding-summary"></div>
         <div class="tab-switch" id="holding-kind"><button data-holding-kind="real" class="selected">真实持仓</button><button data-holding-kind="paper">模拟持仓</button></div>
         <section class="panel"><div class="table-wrap" id="holdings-content"></div></section>
@@ -92,7 +93,7 @@
       </section>
 
       <section class="page hidden" id="analyze">
-        <div class="page-title"><div><span class="kicker" id="analyze-kicker">A股 · 单股分析</span><h1>输入一只股票，逐策略判断</h1><p>临时分析不写入持仓，也不占用持续监测名额。</p></div></div>
+        <div class="page-title"><div><span class="kicker" id="analyze-kicker">A股 · 单股分析</span><h1>输入一只股票，逐策略判断</h1><p>临时分析不写入持仓，也不占用持续监测名额。</p></div><button class="secondary" data-ask-gpt="analysis">将当前分析问 GPT</button></div>
         <section class="panel analyze-entry">
           <form id="analyze-form">
             <div class="analyze-symbol"><label>股票代码或名称<input id="analyze-symbol" list="analyze-suggestions" required maxlength="20" placeholder="600519.SH / AAPL.US" autocomplete="off"><datalist id="analyze-suggestions"></datalist></label><button class="primary">开始分析</button></div>
@@ -100,6 +101,45 @@
           </form>
         </section>
         <div id="analyze-result"><div class="empty-primary"><div><div class="empty-icon">◎</div><h2>等待输入股票</h2><p>系统会读取同一来源的日线、五分钟K线、最新报价和盘口，再运行当前市场适用的全部策略。</p></div></div></div>
+      </section>
+
+      <section class="page hidden" id="gpt">
+        <div class="page-title"><div><span class="kicker" id="gpt-kicker">A股 · GPT 选股</span><h1>GPT 选股工作台</h1><p>ChatGPT负责全市场发现，本机负责实时行情与风险否决；两边都通过才会显示“当前可考虑”。</p></div></div>
+        <div class="gpt-steps"><span class="active">1 生成任务</span><span>2 ChatGPT研究</span><span>3 粘贴答案</span><span>4 本地复核</span></div>
+        <div class="gpt-workbench">
+          <section class="panel gpt-compose">
+            <div class="panel-head"><div><span class="kicker">第 1 步</span><h2>生成GPT全市场扫描任务</h2></div><span id="gpt-mode-hint">自动识别市场阶段</span></div>
+            <form id="gpt-form">
+              <div class="gpt-mode-picker"><button type="button" class="selected" data-gpt-mode="auto">自动</button><button type="button" data-gpt-mode="premarket">盘前</button><button type="button" data-gpt-mode="intraday">盘中</button><button type="button" data-gpt-mode="single_stock">单股</button></div>
+              <label id="gpt-symbol-label" class="hidden">单股代码<input id="gpt-symbol" maxlength="20" placeholder="600519.SH / AAPL.US" autocomplete="off"></label>
+              <div class="gpt-options"><label><input id="gpt-account" type="checkbox"> 本次包含脱敏账户摘要</label></div>
+              <p class="form-hint">账户默认关闭。GPT可发现本地池外股票，但最多3只，导入后仍须逐只通过本机核验。</p>
+              <button class="primary" id="generate-gpt-context">生成GPT全市场扫描任务</button>
+            </form>
+            <div class="gpt-conversation"><label>研究对话链接（可选，仅 chatgpt.com）<input id="gpt-conversation-url" maxlength="2048" placeholder="https://chatgpt.com/c/..."></label><button class="secondary" id="save-gpt-conversation">保存链接</button></div>
+          </section>
+
+          <section class="panel gpt-preview">
+            <div class="panel-head"><div><span class="kicker">第 2 步</span><h2 id="gpt-preview-title">尚未生成任务</h2></div><span id="gpt-preview-meta"></span></div>
+            <div id="gpt-warnings"></div><textarea id="gpt-prompt" readonly placeholder="点击生成后，这里会显示要求 @longbridge 先扫描全市场的完整任务。"></textarea>
+            <div class="gpt-actions"><button class="primary" id="copy-open-chatgpt" disabled>复制并打开 Longbridge App</button><button class="secondary" id="copy-gpt" disabled>仅复制任务</button><a class="text-button hidden" id="open-saved-conversation" target="_blank" rel="noopener noreferrer">打开已保存对话</a></div>
+            <p class="form-hint">在ChatGPT内确认 <code>@longbridge</code> 调用。若剪贴板或新窗口被拦截，可手工选择上方全文。</p>
+          </section>
+
+          <section class="panel gpt-import">
+            <div class="panel-head"><div><span class="kicker">第 3 步</span><h2>粘贴ChatGPT完整答案</h2></div><span>只解析 SHORTLIST_RESULT_V1 JSON</span></div>
+            <textarea id="gpt-response" maxlength="102400" placeholder="把ChatGPT的整段答案粘贴到这里。普通分析可以保留，但末尾必须有SHORTLIST_RESULT_V1结构化区块。"></textarea>
+            <div class="gpt-actions"><button class="primary" id="import-gpt-result" disabled>导入并进行本地复核</button><button class="secondary" id="clear-gpt-response">清空</button></div>
+            <div id="gpt-import-message" class="form-hint">无结构化区块或字段错误时，不会激活任何候选，原文会保留供你修改。</div>
+          </section>
+
+          <section class="panel gpt-results">
+            <div class="panel-head"><div><span class="kicker">第 4 步</span><h2>当日GPT池与本地执行门</h2></div><span id="gpt-run-meta">尚未导入</span></div>
+            <div id="gpt-result-cards"><div class="empty">导入后会分别显示：GPT精选·等确认、当前可考虑、暂不参与。</div></div>
+            <form id="gpt-followup-form" class="gpt-followup hidden"><label>继续追问<input id="gpt-followup-question" minlength="1" maxlength="2000" placeholder="例如：价格变化后，原确认条件是否仍成立？"></label><button class="secondary">生成增量追问任务</button></form>
+          </section>
+        </div>
+        <aside class="gpt-safety">不调用OpenAI API，不自动读取ChatGPT，不产生后台模型费用。复制后的内容会进入ChatGPT；长桥与盈透凭证始终留在本机，任何真实交易仍由你自行确认。</aside>
       </section>
 
       <section class="page hidden" id="strategy">

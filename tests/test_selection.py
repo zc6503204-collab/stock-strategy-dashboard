@@ -1,6 +1,6 @@
 from datetime import timedelta
 from app.models import Bar,stamp
-from app.selection import evaluate,candidate_pool,ranking_key
+from app.selection import evaluate,candidate_pool,ranking_key,diversified_rank
 
 def daily(step=.1,amount=2e8):
     t=stamp('2026-06-01T01:30Z')
@@ -44,3 +44,17 @@ def test_strategy_match_breaks_equal_decision_ties_before_generic_score():
     base={'decision':'重点观察','score':100,'distance_to_high_pct':0,'candidate_strategies':[]}
     matched={**base,'score':80,'candidate_strategies':['trend_pullback']}
     assert sorted([base,matched],key=ranking_key)[0] is matched
+
+def test_industry_soft_diversification_starts_with_third_same_industry():
+    def pick(symbol,score,industry):
+        return {'symbol':symbol,'decision':'重点观察','score':score,'distance_to_high_pct':0,
+                'candidate_strategies':['breakout'],'industry':industry}
+    rows=[pick('BANK1',100,'银行'),pick('BANK2',99,'银行'),pick('BANK3',98,'银行'),pick('TECH',97,'软件')]
+    assert [r['symbol'] for r in diversified_rank(rows,4)][:3]==['BANK1','BANK2','TECH']
+
+def test_industry_diversification_is_not_a_hard_cap():
+    def pick(symbol,score,industry):
+        return {'symbol':symbol,'decision':'重点观察','score':score,'distance_to_high_pct':0,
+                'candidate_strategies':['breakout'],'industry':industry}
+    rows=[pick('BANK1',100,'银行'),pick('BANK2',99,'银行'),pick('BANK3',98,'银行'),pick('TECH',80,'软件')]
+    assert [r['symbol'] for r in diversified_rank(rows,3)]==['BANK1','BANK2','BANK3']

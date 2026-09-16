@@ -1,4 +1,5 @@
 import asyncio,json,time,re,statistics
+from uuid import uuid4
 from pathlib import Path
 from datetime import timedelta
 from .models import now,stamp,symbol_market,in_scope,Bar,Signal
@@ -11,9 +12,12 @@ from .alerts import Alerts
 from .calendars import calendar,monitoring_window,close_time
 from .simulation import Simulation
 from .store import Store
-from .selection import evaluate as evaluate_selection,candidate_pool,ranking_key as selection_rank
+from .selection import evaluate as evaluate_selection,candidate_pool,ranking_key as selection_rank,diversified_rank
 from .holdings import RealHoldings,real_holding_plan
 from .strategy_registry import StrategyRegistry,DEFINITIONS
+from .gpt_handoff import build_context
+from .gpt_workspace import (build_package_prompt,extract_result,resolve_mode,response_digest,
+                            validate_result,valid_chatgpt_url,LONGBRIDGE_APP_URL)
 
 DAILY_FETCH_COUNT=270
 DAILY_CACHE_MIN=260
@@ -47,12 +51,19 @@ class Dashboard:
         self.real=RealHoldings(self.store)
         self.alerts=Alerts(self.store,root);self.books={};self.decisions=[];self.exit_plans=[];self.real_plans=[]
         self.research_ready={};self.research_progress={};self.benchmark_daily={};self.last_live=0.;self.last_research=0.
+        self.last_decision_eval=0.
         self.started_at=time.monotonic()
         self.monitor_running=self.store.get("monitor_running",True);self.runtime_ok=None
         self.manual_watch=self.store.get("manual_watch",[]);self.live_task=None;self.access_task=None;self.access_pending=False;self.ib_connect_task=None
         self.candidates=self.store.get('candidates',[]);self.quotes={};self.comparisons={};self.details={}
         self.settings=self.store.get('settings',{'monitor_limit':12,'simulation_enabled':True,'ib_port':7497})
-        self.watch=self.store.get('watch',[]);self.scanning=False;self.last_scan=self.store.get('last_scan')
+        self.watch=self.store.get('watch',[]);self.scanning=False;self.scan_task=None;self.last_scan=self.store.get('last_scan')
+        self.daily_core=self.store.get('daily_candidate_core',{})
+        core_trimmed=False
+        for market,core in self.daily_core.items():
+            if len(core.get('rows',[]))>80:
+                self.daily_core[market]={**core,'rows':self.limit_core_rows(core['rows'])};core_trimmed=True
+        if core_trimmed:self.store.set('daily_candidate_core',self.daily_core)
         self.market_stats=self.store.get('market_stats',{});self.market_stats_time=self.store.get('market_stats_time')
         self.tasks=[];self.alive=True;self.listeners=set();self.fetch_lock=asyncio.Lock();self.last_cycle=time.monotonic()
         self.last_bars_cycle=0.;self.last_quote_cycle=0.;self.last_scan_cycle=0.;self.validation={};self.first_poll=True
@@ -64,6 +75,11 @@ class Dashboard:
         self.holding_sync=self.store.get('holding_sync',{
             'longbridge':{'state':'waiting','message':'等待首次同步'},
             'ibkr':{'state':'waiting','message':'等待本地接口连接'}})
+        self.account_summaries=self.store.get('account_summaries',{})
+        self.gpt_packages=self.store.get('gpt_packages',[])
+        self.gpt_runs=self.store.get('gpt_runs',[])
+        self.gpt_conversations=self.store.get('gpt_conversations',{})
+        self.cleanup_gpt_data()
         self.last_holdings_sync=0.;self.holdings_task=None
         # Static security reference prevents leveraged ETFs and similarly named products entering a stock-only pool.
         p=root/'.local/vendor/gtht/lingxi-realtimemarketdata-skill/stock_code_name.json'
@@ -76,12 +92,11 @@ class Dashboard:
     async def start(self):
         import os
         (self.root/'.local/server.pid').write_text(str(os.getpid()))
-        await self.lb.connect_cached()
         if self.store.get('engine_version')!=VERSION:
             for sid,raw in list(self.sim.state['pending'].items()):
                 self.sim.fail(raw['symbol'],'升级新版，取消旧待买信号',now());del self.sim.state['pending'][sid]
             self.sim.save();self.store.set('engine_version',VERSION)
-        self.tasks=[asyncio.create_task(self.run()),asyncio.create_task(self.live_loop()),
+        self.tasks=[asyncio.create_task(self.lb.connect_cached()),asyncio.create_task(self.run()),asyncio.create_task(self.live_loop()),
                     asyncio.create_task(self.research_loop()),asyncio.create_task(self.holdings_loop()),
                     asyncio.create_task(self.alerts.worker())]
 
@@ -105,6 +120,7 @@ class Dashboard:
                 if not self.monitor_running:
                     await asyncio.sleep(1);continue
                 tick=time.monotonic()
+                self.cleanup_gpt_data()
                 if tick-self.last_cycle>90:
                     for s in self.tracked():self.suspend(s,'运行中断／休眠，重新补齐数据')
                     self.first_poll=True
@@ -128,14 +144,19 @@ class Dashboard:
                         self.access_task=asyncio.create_task(self.verify_longbridge_access())
                         self.tasks.append(self.access_task)
                 if self.first_poll:
-                    if not self.scanning:
-                        task=asyncio.create_task(self.scan());self.tasks.append(task)
+                    marker=self.store.get('premarket_scan_marker',{})
+                    due=[m for m in ['CN','US'] if marker.get(m)!=self.candidate_trade_date(m)
+                         or self.daily_core.get(m,{}).get('trade_date')!=self.candidate_trade_date(m)
+                         or self.daily_core.get(m,{}).get('stale')]
+                    if due and not self.scanning:
+                        task=asyncio.create_task(self.run_premarket_scan(due));self.tasks.append(task)
+                    elif not self.scanning:self.request_scan()
                     self.last_scan_cycle=time.monotonic()
                 elif active and tick-self.last_scan_cycle>300:
-                    await self.scan();self.last_scan_cycle=time.monotonic()
+                    await self.request_scan();self.last_scan_cycle=time.monotonic()
                 elif preparing:
                     marker=self.store.get('premarket_scan_marker',{})
-                    due=[m for m in preparing if marker.get(m)!=str(local_date(now(),m))]
+                    due=[m for m in preparing if marker.get(m)!=self.candidate_trade_date(m)]
                     if due and not self.scanning:
                         task=asyncio.create_task(self.run_premarket_scan(due));self.tasks.append(task)
                 if self.first_poll or any(s not in self.details for s in self.tracked()) or (active and tick-self.last_bars_cycle>60):
@@ -151,11 +172,30 @@ class Dashboard:
             self.last_cycle=time.monotonic()
             await asyncio.sleep(5)
 
+    def candidate_trade_date(self,market):
+        current=local_date(now(),market);cal=calendar(market)
+        try:
+            if cal.is_session(str(current)) and phase(now(),market)!='已收盘':return str(current)
+            if cal.is_session(str(current)):return str(cal.next_session(str(current)).date())
+            return str(cal.date_to_session(str(current),direction='next').date())
+        except Exception:return str(current)
+
+    def request_scan(self,force_strategy=False,rebuild_markets=None,wait_selection=False):
+        """Coalesce callers onto one running provider scan."""
+        if self.scan_task and not self.scan_task.done():return self.scan_task
+        self.scan_task=asyncio.create_task(self.scan(force_strategy,rebuild_markets,wait_selection))
+        self.tasks.append(self.scan_task)
+        return self.scan_task
+
     async def run_premarket_scan(self,markets):
-        """Run one fresh scan per market session, then persist successful completion."""
-        await self.scan(force_strategy='CN' in markets)
+        """Rebuild due market cores and mark completion only after deep validation."""
+        markets=list(dict.fromkeys(markets))
+        await self.request_scan(force_strategy='CN' in markets,rebuild_markets=markets,wait_selection=True)
         marker=self.store.get('premarket_scan_marker',{})
-        marker.update({market:str(local_date(now(),market)) for market in markets})
+        for market in markets:
+            core=self.daily_core.get(market,{})
+            if core.get('trade_date')==self.candidate_trade_date(market) and not core.get('stale'):
+                marker[market]=core['trade_date']
         self.store.set('premarket_scan_marker',marker)
         self.broadcast()
 
@@ -247,28 +287,90 @@ class Dashboard:
         for key,value in row.items():
             if current.get(key) is None and value is not None:current[key]=value
 
-    async def scan(self,force_strategy=False):
-        if self.scanning:return
+    @staticmethod
+    def longbridge_candidates(payload,role,generated_at,trade_date):
+        items=payload.get('items',[]) if isinstance(payload,dict) else []
+        rows=[]
+        for raw in items:
+            if not isinstance(raw,dict) or not raw.get('symbol'):continue
+            rows.append({'symbol':str(raw['symbol']).upper(),'name':raw.get('name') or raw['symbol'],
+                'industry':str(raw.get('industry') or '').strip() or None,'price':number(raw.get('prevclose')),
+                'change_pct':number(raw.get('prevchg')),'market_cap':number(raw.get('marketcap')),
+                'source':'longbridge','reason':'长桥全市场活跃候选 · 待本地日线和流动性核验',
+                'market_time':None,'scope':'长桥全市场筛选返回最多80只','candidate_origin':'market_screener',
+                'candidate_strategies':[],'pool_role':role,'candidate_date':trade_date,
+                'candidate_updated_at':generated_at})
+        return rows
+
+    def limit_core_rows(self,rows,limit=80):
+        """Merge duplicate sources, keep strategy names first, and enforce the research-pool cap."""
+        unique={}
+        for row in rows:self.merge_candidate(unique,row)
+        return candidate_pool(list(unique.values()),[],set(),limit)
+
+    async def scan(self,force_strategy=False,rebuild_markets=None,wait_selection=False):
+        if self.scanning:return set()
         self.scanning=True;self.broadcast()
+        rebuilt=set();scan_time=now().isoformat()
         try:
-            strategy_rows,_=await self.strategy_candidate_scan(force_strategy)
-            rows=list(strategy_rows)
-            # One serialized request per provider, bounded candidate universe, no full-market claim.
-            for order in [10,2]:
-                found,stats=await self.lingxi.rank(order)
-                for row in found:
-                    row.update(candidate_origin='rank_supplement',candidate_strategies=[])
-                rows.extend(found)
-                if stats:self.market_stats=stats
-                if found:self.market_stats_time=found[0].get('market_time')
-            try:
-                us=await self.lb.cli_scan('US')
-                for r in us.get('items',[]):
-                    rows.append({'symbol':r['symbol'],'name':r.get('name',r['symbol']),'price':number(r.get('prevclose')),
-                     'change_pct':number(r.get('prevchg')),'market_cap':number(r.get('marketcap')),'source':'longbridge',
-                     'reason':'美股涨幅候选 · 待流动性核验','market_time':None,'scope':'长桥美股筛选返回前40只'})
-            except Exception:
-                if not self.lb.ctx:self.lb.status.update(message='持续行情待授权；美股筛选接口本次未返回')
+            requested=set(rebuild_markets or ())
+            if force_strategy and rebuild_markets is None:requested={'CN','US'}
+            for market in ('CN','US'):
+                core=self.daily_core.get(market,{})
+                if core.get('trade_date')!=self.candidate_trade_date(market):requested.add(market)
+            rows=[]
+            if 'CN' in requested:
+                try:
+                    strategy_rows,status=await self.strategy_candidate_scan(True)
+                    core_rows=[]
+                    for row in strategy_rows:
+                        core_rows.append({**row,'pool_role':'daily_core','candidate_date':self.candidate_trade_date('CN'),
+                                          'candidate_updated_at':scan_time})
+                    longbridge_ok=False
+                    try:
+                        cn=await self.lb.cli_scan('CN')
+                        core_rows.extend(self.longbridge_candidates(cn,'daily_core',scan_time,self.candidate_trade_date('CN')))
+                        longbridge_ok=True
+                    except Exception:pass
+                    if not status.get('queries') and not longbridge_ok:raise RuntimeError('A股每日核心池未返回可验证结果')
+                    core_rows=self.limit_core_rows(core_rows)
+                    self.daily_core['CN']={'trade_date':self.candidate_trade_date('CN'),'updated_at':scan_time,
+                                           'rows':core_rows,'stale':False,'errors':status.get('errors',[])}
+                    rebuilt.add('CN')
+                except Exception:
+                    if self.daily_core.get('CN'):
+                        self.daily_core['CN']={**self.daily_core['CN'],'stale':True,'error':'A股每日核心池刷新失败'}
+            rows.extend(self.daily_core.get('CN',{}).get('rows',[]))
+            if is_open(now(),'CN') or phase(now(),'CN')=='集合竞价':
+                for order in [10,2]:
+                    try:found,stats=await self.lingxi.rank(order)
+                    except Exception:found,stats=[],{}
+                    for row in found:
+                        row.update(candidate_origin='rank_supplement',candidate_strategies=[],pool_role='intraday_supplement',
+                                   candidate_date=self.candidate_trade_date('CN'),candidate_updated_at=scan_time)
+                    rows.extend(found)
+                    if stats:self.market_stats=stats
+                    if found:self.market_stats_time=found[0].get('market_time')
+            if 'US' in requested:
+                try:
+                    us=await self.lb.cli_scan('US')
+                    core_rows=self.limit_core_rows(
+                        self.longbridge_candidates(us,'daily_core',scan_time,self.candidate_trade_date('US')))
+                    self.daily_core['US']={'trade_date':self.candidate_trade_date('US'),'updated_at':scan_time,
+                                           'rows':core_rows,'stale':False,'errors':[]}
+                    rebuilt.add('US')
+                except Exception:
+                    if self.daily_core.get('US'):
+                        self.daily_core['US']={**self.daily_core['US'],'stale':True,'error':'美股每日核心池刷新失败'}
+                    if not self.lb.ctx:self.lb.status.update(message='持续行情待授权；美股筛选接口本次未返回')
+            rows.extend(self.daily_core.get('US',{}).get('rows',[]))
+            if 'US' not in requested and is_open(now(),'US'):
+                try:
+                    us=await self.lb.cli_scan('US')
+                    rows.extend(self.longbridge_candidates(us,'intraday_supplement',scan_time,self.candidate_trade_date('US')))
+                except Exception:
+                    if not self.lb.ctx:self.lb.status.update(message='持续行情待授权；美股盘中补充本次未返回')
+            self.store.set('daily_candidate_core',self.daily_core)
             unique={}
             for r in rows:
                 if not self.allowed_security(r):continue
@@ -276,13 +378,16 @@ class Dashboard:
                 r['risk_group']=group;r['market']=symbol_market(r['symbol'])
                 r['eligible']=False;r['eligibility_reason']='等待日线、流动性与交易状态核验'
                 self.merge_candidate(unique,r)
-            if unique:
-                if force_strategy:
-                    # A manual full-universe refresh starts a clean research pool. Real/simulated
-                    # holdings and explicit manual watches remain protected by allocate_monitoring.
-                    self.store.set('selection_pool',{})
+            if unique or rebuilt:
+                if requested:
+                    saved_pool=self.store.get('selection_pool',{})
+                    if requested=={'CN','US'}:self.store.set('selection_pool',{})
+                    else:
+                        kept=[r for r in saved_pool.get('rows',[]) if symbol_market(r['symbol']) not in requested]
+                        dates={k:v for k,v in saved_pool.get('dates',{}).items() if k not in requested}
+                        self.store.set('selection_pool',{'dates':dates,'rows':kept})
                     current_symbols=set(unique)
-                    self.selection=[r for r in self.selection if r.get('symbol') in current_symbols]
+                    self.selection=[r for r in self.selection if r.get('market') not in requested or r.get('symbol') in current_symbols]
                     self.store.event('selection',{'message':'已重新运行全市场策略筛选，盘前候选池不沿用上一轮结果'})
                 self.candidates=list(unique.values())
                 # Stable monitoring slots: do not silently evict a user-selected stock on rank changes.
@@ -300,30 +405,36 @@ class Dashboard:
                 self.last_scan=now().isoformat()
                 self.store.set('candidates',self.candidates);self.store.set('last_scan',self.last_scan)
                 self.store.set('market_stats',self.market_stats);self.store.set('market_stats_time',self.market_stats_time)
+                if self.selection_task and not self.selection_task.done():await self.selection_task
+                selection_task=self.schedule_selection()
+                if wait_selection and selection_task:await selection_task
+            return rebuilt
         finally:self.scanning=False;self.broadcast()
-        self.schedule_selection()
 
     def schedule_selection(self):
-        if self.selection_task and not self.selection_task.done():return
+        if self.selection_task and not self.selection_task.done():return self.selection_task
         self.selection_task=asyncio.create_task(self.refresh_selection())
         self.tasks.append(self.selection_task)
+        return self.selection_task
 
     async def refresh_selection(self):
         self.selection_running=True;self.selection_errors=[]
-        today=str(local_date(now(),'CN'))
         saved=self.store.get('selection_pool',{})
-        retained=saved.get('rows',[]) if saved.get('date')==today else []
+        saved_dates=saved.get('dates',{})
+        if not saved_dates and saved.get('date'):saved_dates={'CN':saved['date']}
+        retained=[r for r in saved.get('rows',[]) if saved_dates.get(symbol_market(r['symbol']))==self.candidate_trade_date(symbol_market(r['symbol']))]
         # Keep tracked names and a small continuity set, while leaving most slots for today's strategy screen.
         continuity=[r['symbol'] for r in self.selection if r['decision']=='重点观察'][:8]
         preferred=set(continuity) | set(self.tracked())
-        rows=candidate_pool([r for r in self.candidates if r.get('market')=='CN'],[r for r in retained if r.get('market')=='CN'],preferred)
-        rows += [r for r in self.candidates if r.get('market')=='US'][:40]
-        self.store.set('selection_pool',{'date':today,'rows':rows})
+        rows=[]
+        for market in ('CN','US'):
+            rows+=candidate_pool([r for r in self.candidates if r.get('market')==market],
+                                 [r for r in retained if symbol_market(r['symbol'])==market],preferred,80)
         existing={r['symbol'] for r in self.candidates}
         self.candidates.extend(r for r in rows if r['symbol'] not in existing)
         self.selection_progress={'done':0,'total':len(rows)};self.broadcast()
         previous={r['symbol']:r for r in self.selection}
-        target={r['symbol'] for r in rows};processed=set();results=[]
+        results=[]
         try:
             try:
                 references=await self.lb.reference_info([r['symbol'] for r in rows])
@@ -347,7 +458,9 @@ class Dashboard:
                         self.store.set(key,{'fetched_date':str(local_date(now(),symbol_market(row['symbol']))),'bars':[b.dump() for b in daily]})
                     if reference and reference.get('total_shares') and daily:row['market_cap']=daily[-1].close*reference['total_shares']
                     item=evaluate_selection(row,daily)
-                    item.update(candidate_origin=row.get('candidate_origin','retained'),candidate_strategies=row.get('candidate_strategies',[]))
+                    item.update(candidate_origin=row.get('candidate_origin','retained'),candidate_strategies=row.get('candidate_strategies',[]),
+                                pool_role=row.get('pool_role','daily_core'),candidate_date=row.get('candidate_date'),
+                                candidate_updated_at=row.get('candidate_updated_at'))
                     f=daily_factors(row['symbol'],daily,self.benchmark_daily.get(symbol_market(row['symbol']),[]))
                     item.update(relative_strength=f.get('relative_strength'),research_reason=f['reason'])
                     if not f.get('eligible') and item['decision']=='重点观察':item.update(decision='等确认',reason=f['reason'])
@@ -357,10 +470,7 @@ class Dashboard:
                     results.append(item)
                 except Exception:
                     self.selection_errors.append({'symbol':row['symbol'],'reason':'完整日线或成交量口径未通过核验'})
-                processed.add(row['symbol'])
                 self.selection_progress['done']+=1
-                visible=results+[r for symbol,r in previous.items() if symbol in target and symbol not in processed]
-                self.selection=sorted(visible,key=selection_rank)
                 if self.selection_progress['done']%10==0 or self.selection_progress['done']==self.selection_progress['total']:self.broadcast()
                 await asyncio.sleep(.1)
             for market in ['CN','US']:
@@ -370,10 +480,27 @@ class Dashboard:
                     item['rs_percentile']=100. if coverage==1 else round(index/(coverage-1)*100,1)
                     item['rs_rank_coverage']=coverage
                     self.strategies.set_relative_rank(item['symbol'],item['rs_percentile'],coverage)
+            attempted={symbol_market(r['symbol']) for r in rows}
+            succeeded={r['market'] for r in results}
+            failed=attempted-succeeded
+            for market in failed:
+                if self.daily_core.get(market):
+                    self.daily_core[market]={**self.daily_core[market],'stale':True,'error':'每日候选未通过本轮日线数据核验'}
+            if failed:
+                results.extend(r for r in previous.values() if r.get('market') in failed)
+                self.store.set('daily_candidate_core',self.daily_core)
             self.selection=sorted(results,key=selection_rank)
-            self.store.set('selection',self.selection);self.store.set('selection_updated',now().isoformat())
+            updated=now().isoformat()
+            self.store.set('selection',self.selection);self.store.set('selection_updated',updated)
+            updated_by_market=self.store.get('selection_updated_by_market',{})
+            updated_by_market.update({market:updated for market in succeeded})
+            self.store.set('selection_updated_by_market',updated_by_market)
             by_symbol={r['symbol']:r for r in rows}
-            self.store.set('selection_pool',{'date':today,'rows':[by_symbol[r['symbol']] for r in self.selection]})
+            pool_rows=[by_symbol[r['symbol']] for r in self.selection if r['symbol'] in by_symbol and r.get('market') not in failed]
+            pool_rows.extend(r for r in saved.get('rows',[]) if symbol_market(r['symbol']) in failed)
+            pool_dates={m:self.candidate_trade_date(m) for m in ('CN','US') if m not in failed}
+            pool_dates.update({m:d for m,d in saved_dates.items() if m in failed})
+            self.store.set('selection_pool',{'dates':pool_dates,'updated_at':updated,'rows':pool_rows})
             self.allocate_monitoring()
         finally:self.selection_running=False;self.broadcast()
 
@@ -384,7 +511,7 @@ class Dashboard:
         held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
         self.store.set('watch_before_priority',self.watch)
         existing=[s for s in self.watch if market=='ALL' or symbol_market(s)==market]
-        self.watch=list(dict.fromkeys(self.real.symbols()+held+preferred+self.manual_watch+existing))[:self.settings['monitor_limit']]
+        self.watch=list(dict.fromkeys(self.real.symbols()+held+self.manual_watch+self.active_gpt_symbols()+preferred+existing))[:self.settings['monitor_limit']]
         self.store.set('watch',self.watch)
         if self.lb.ctx:
             for q in await self.lb.quotes(self.tracked()):self.accept_quote(q)
@@ -446,8 +573,9 @@ class Dashboard:
         # Keep one source explicit; supplemental snapshots do not overwrite a healthy strategy source.
         if not selected or selected.source==q.source or q.source==self.validation.get(q.symbol,{}).get('source') or (now()-selected.received_at).total_seconds()>30:
             self.quotes[q.symbol]=q
-        self.evaluate_decisions()
-        self.broadcast()
+        tick=time.monotonic()
+        if tick-self.last_decision_eval>=1:
+            self.evaluate_decisions();self.last_decision_eval=tick
 
     def suspend(self,symbol,reason):
         detail=self.details.setdefault(symbol,{})
@@ -488,8 +616,9 @@ class Dashboard:
         if eligible:
             for s in signals:
                 self.register_signal(s)
-        self.evaluate_decisions()
-        self.broadcast()
+        tick=time.monotonic()
+        if tick-self.last_decision_eval>=1:
+            self.evaluate_decisions();self.last_decision_eval=tick
 
     async def refresh_bars(self,symbols=None):
         async with self.fetch_lock:
@@ -605,9 +734,11 @@ class Dashboard:
         research_pool=self.store.get('selection_pool',{}).get('rows',[])
         strategy_screen=self.store.get('strategy_candidate_screen',{})
         workspaces={m:self.market_workspace(m,rows,simulation,alerts) for m in ['CN','US']}
-        return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 4.0','settings':self.settings,
+        gpt={m:self.gpt_list_runs(m) for m in ['CN','US']}
+        return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 4.2','settings':self.settings,
                 'decisions':self.decisions,'exit_plans':self.exit_plans,'real_holdings':self.real.list(),'real_plans':self.real_plans,
                 'holding_sync':self.holding_sync,'premarket':{m:self.premarket(m) for m in ['CN','US']},'alerts':alerts,
+                'gpt':gpt,
                 'notification_settings':self.alerts.status(),'monitor':{'running':self.monitor_running,'last_ok':self.runtime_ok,'ai_calls':0,'research':self.research_progress,
                     'window':{m:monitoring_window(now(),m) for m in ['CN','US']},'uncovered':max(0,len(self.selection)-len(tracked)),
                     'uncovered_holdings':sum(s not in tracked for s in real_symbols)},
@@ -620,6 +751,11 @@ class Dashboard:
                     'supplement_candidates_by_market':{m:sum(symbol_market(r['symbol'])==m and not r.get('candidate_strategies') for r in self.candidates) for m in ['CN','US']},
                     'research_pool_by_market':{m:sum(symbol_market(r['symbol'])==m for r in research_pool) for m in ['CN','US']},
                     'selection_by_market':{m:sum(r.get('market')==m for r in self.selection) for m in ['CN','US']},
+                    'pool_status_by_market':{m:{'trade_date':self.daily_core.get(m,{}).get('trade_date'),
+                        'updated_at':self.daily_core.get(m,{}).get('updated_at'),'stale':bool(self.daily_core.get(m,{}).get('stale')),
+                        'core_count':len(self.daily_core.get(m,{}).get('rows',[])),
+                        'supplement_count':sum(r.get('market')==m and r.get('pool_role')=='intraday_supplement' for r in self.candidates),
+                        'error':self.daily_core.get(m,{}).get('error')} for m in ['CN','US']},
                     'monitored':len(self.tracked()),'ready':sum(bool(v.get('ready')) for s,v in self.validation.items() if s in self.tracked()),
                     'last_scan':self.last_scan,'full_market':False,'strategy_universe':'A股全市场','scope_label':'灵犀全市场策略初筛，本地仅复核返回候选',
                     'strategy_screen':{k:strategy_screen.get(k) for k in ['updated_at','queries','errors']}},
@@ -1095,6 +1231,382 @@ class Dashboard:
                 'next_confirmation_at':next_confirmation,'market_phase':market_phase,'monitoring':monitoring,
                 'note':'已加入持续监测；本机规则会自动更新，不调用AI' if symbol in self.tracked() else '即时快照不会自动写入持仓或占用监测名额；点击加入后才持续跟踪'}
 
+    def cached_stock_context(self,symbol):
+        candidate=next((r for r in self.candidates if r.get('symbol')==symbol),{})
+        selection=next((r for r in self.selection if r.get('symbol')==symbol),{})
+        quote=self.quotes.get(symbol)
+        detail=self.details.get(symbol,{})
+        decision=next((r for r in self.decisions if r.get('symbol')==symbol),None)
+        name=candidate.get('name') or selection.get('name') or self.security_map.get(symbol,{}).get('name') or symbol
+        return {'symbol':symbol,'name':name,'market':symbol_market(symbol),'quote':quote.dump() if quote else None,
+                'source':detail.get('source') or candidate.get('source') or selection.get('source') or 'longbridge',
+                'data_status':detail.get('status','cached'),'technical':selection,
+                'blocked_conditions':[detail.get('reason')] if detail.get('reason') else [],
+                'final':{'action':decision.get('action','继续等待') if decision else selection.get('decision','继续等待'),
+                         'reason':decision.get('reason') if decision else detail.get('reason') or selection.get('reason') or '仅使用本地最近快照'}}
+
+    async def account_context(self,refresh):
+        """Only called after a per-request explicit account opt-in."""
+        warnings=[];stale_positions=set()
+        if refresh:
+            for source in ('longbridge','ibkr'):
+                provider=self.providers[source]
+                try:
+                    summary=await provider.account_summary()
+                    self.account_summaries[source]=summary
+                except Exception:
+                    if source in self.account_summaries:
+                        self.account_summaries[source]={**self.account_summaries[source],'stale':True}
+                        warnings.append(f'{"长桥" if source=="longbridge" else "盈透"}账户摘要刷新失败，使用上次脱敏快照')
+                    else:warnings.append(f'{"长桥" if source=="longbridge" else "盈透"}账户摘要不可用，本次已省略')
+                try:
+                    rows=await provider.account_positions()
+                    synced=self.real.replace_synced(source,rows)
+                    self.holding_sync[source]={'state':'connected','message':f'已同步 {len(synced)} 只多头股票持仓',
+                                               'updated_at':now().isoformat(),'count':len(synced)}
+                except Exception:
+                    current=sum(r.get('source')==source for r in self.real.list())
+                    if current:
+                        stale_positions.add(source)
+                        warnings.append(f'{"长桥" if source=="longbridge" else "盈透"}持仓刷新失败，使用上次有效快照')
+                    else:warnings.append(f'{"长桥" if source=="longbridge" else "盈透"}持仓不可用，本次已省略')
+            self.store.set('account_summaries',self.account_summaries)
+            self.store.set('holding_sync',self.holding_sync)
+        summaries=[]
+        for source,row in self.account_summaries.items():
+            summaries.append({k:v for k,v in row.items() if k in {'source','balances','updated_at','stale'}}|{'source_label':'长桥' if source=='longbridge' else '盈透'})
+        positions=[]
+        for row in self.real.list():
+            if row.get('source') not in ('longbridge','ibkr'):continue
+            quote=self.quotes.get(row['symbol'])
+            price=quote.price if quote else row.get('cost')
+            clean={k:row.get(k) for k in ('symbol','name','source','quantity','cost','currency','updated_at')}
+            clean['source_label']='长桥' if row.get('source')=='longbridge' else '盈透'
+            clean['market_value']=round(abs(number(row.get('quantity'),0)*number(price,0)),4)
+            clean['stale']=row.get('source') in stale_positions
+            positions.append(clean)
+        positions.sort(key=lambda row:(-row['market_value'],row['source'],row['symbol']))
+        omitted=max(0,len(positions)-40)
+        if omitted:warnings.append(f'持仓共{len(positions)}只，仅带入市值前40只，已省略{omitted}只')
+        position_sources=[]
+        for source in ('longbridge','ibkr'):
+            rows=[row for row in positions if row['source']==source]
+            if rows:position_sources.append({'source':source,'source_label':'长桥' if source=='longbridge' else '盈透',
+                                             'updated_at':max((row.get('updated_at') or '' for row in rows),default=None),
+                                             'stale':source in stale_positions})
+        return {'included':True,'summaries':summaries,'positions':positions[:40],'omitted_positions':omitted,
+                'position_sources':position_sources},warnings
+
+    def gpt_scan_candidates(self,market,limit=10):
+        available=[r for r in self.selection if r.get('market')==market and r.get('decision')!='暂不参与']
+        bounded=max(1,min(int(limit),20))
+        if bounded<=10:rows=self.premarket(market)[:bounded]
+        else:
+            rows=[]
+            for index,row in enumerate(diversified_rank([dict(r) for r in available],bounded),1):
+                rows.append({**row,'rank':index,'industry':row.get('industry') or '行业未知'})
+        result=[]
+        for row in rows:
+            quote=self.quotes.get(row['symbol'])
+            strategies=[DEFINITIONS[s]['name'] for s in row.get('candidate_strategies',[]) if s in DEFINITIONS]
+            result.append({'rank':row['rank'],'symbol':row['symbol'],'name':row.get('name') or row['symbol'],
+                'industry':row.get('industry') or '行业未知','score':row.get('score'),'decision':row.get('decision'),
+                'strategy_source':'、'.join(strategies) if strategies else '全市场活跃度补充',
+                'price':quote.price if quote else row.get('close'),'price_source':quote.source if quote else row.get('source'),
+                'price_time':quote.market_time.isoformat() if quote and quote.market_time else row.get('as_of'),
+                'confirmation_condition':row.get('reason'),'no_chase_line':row.get('breakout_reference'),
+                'invalidation_condition':row.get('structure_low'),'risk_group':row.get('risk_group'),
+                'pool_role':row.get('pool_role'),'candidate_updated_at':row.get('candidate_updated_at')})
+        core=self.daily_core.get(market,{})
+        stale=bool(core.get('stale')) or core.get('trade_date')!=self.candidate_trade_date(market)
+        return result,{'market':market,'candidate_count':len(available),'included_count':len(result),
+            'omitted_count':max(0,len(available)-len(result)),'trade_date':self.candidate_trade_date(market),
+            'refreshed_at':core.get('updated_at'),'stale':stale,'core_count':len(core.get('rows',[])),
+            'supplement_count':sum(r.get('market')==market and r.get('pool_role')=='intraday_supplement' for r in self.candidates)}
+
+    async def gpt_context(self,data):
+        if not str(data.get('question','')).strip():raise ValueError('请输入要交给 ChatGPT 的研究问题')
+        market=str(data.get('market','')).upper()
+        if market not in ('CN','US'):raise ValueError('请选择A股或美股市场')
+        mode=str(data.get('mode') or 'research')
+        if mode not in ('research','market_scan'):raise ValueError('未知的GPT研究模式')
+        symbol=str(data.get('symbol') or '').upper().strip() or None
+        if mode=='market_scan' and symbol:raise ValueError('全市场扫描不接受单股代码')
+        if symbol:
+            if not re.fullmatch(r'[A-Z0-9.\-]{1,16}\.(US|SH|SZ)',symbol) or symbol_market(symbol)!=market:
+                raise ValueError('股票代码与当前市场不匹配')
+            if not self.allowed_security({'symbol':symbol,'name':self.security_map.get(symbol,{}).get('name','')}):
+                raise ValueError('该股票不在本机允许的研究范围')
+        warnings=[];stock=None;candidates=[];scan_meta=None;refresh_incomplete=False
+        if mode=='market_scan' and data.get('refresh',True):
+            deadline=time.monotonic()+180
+            try:
+                for _ in range(2):
+                    remaining=deadline-time.monotonic()
+                    if remaining<=0:raise asyncio.TimeoutError
+                    task=self.request_scan(force_strategy=market=='CN',rebuild_markets=[market],wait_selection=True)
+                    await asyncio.wait_for(asyncio.shield(task),remaining)
+                    core=self.daily_core.get(market,{})
+                    if core.get('trade_date')==self.candidate_trade_date(market) and not core.get('stale'):break
+            except asyncio.TimeoutError:
+                refresh_incomplete=True
+                warnings.append('全市场刷新超过180秒，使用本机最近有效候选快照；后台仍会继续完成刷新')
+            except Exception:
+                refresh_incomplete=True
+                warnings.append('全市场刷新未完成，使用本机最近有效候选快照')
+        if symbol:
+            if data.get('refresh',True):
+                try:stock=await self.analyze_stock({'symbol':symbol})
+                except Exception:
+                    warnings.append('单股数据刷新未完成，使用本地最近有效快照')
+            stock=stock or self.cached_stock_context(symbol)
+        if mode=='market_scan':
+            candidates,scan_meta=self.gpt_scan_candidates(market)
+            if refresh_incomplete:scan_meta['stale']=True
+            if scan_meta['stale']:warnings.append('候选池不是当前交易日的完整新快照，ChatGPT 必须先刷新并核对后再判断')
+            if not candidates:warnings.append('本地规则本轮没有可交接候选，不得为了凑数推荐股票')
+            elif len(candidates)<10:warnings.append(f'本地规则本轮仅有{len(candidates)}只候选，已全部带入')
+        snapshot=self.snapshot();workspace=snapshot['workspaces'][market]
+        account={'included':False,'summaries':[],'positions':[],'omitted_positions':0}
+        if data.get('include_account',False):
+            account,account_warnings=await self.account_context(bool(data.get('refresh',True)))
+            warnings.extend(account_warnings)
+        sources=[{'source':'dashboard','label':'SHORTLIST本地规则看板','as_of':snapshot['time'],'stale':False}]
+        health=workspace.get('health',{})
+        if health.get('data_as_of'):
+            sources.append({'source':'market','label':f'{workspace["meta"]["name"]}行情/策略快照','as_of':health['data_as_of'],
+                            'stale':health.get('state') in ('delayed','error')})
+        if health.get('last_bar_at'):
+            sources.append({'source':'longbridge','label':f'{workspace["meta"]["name"]}策略K线','as_of':health['last_bar_at'],
+                            'stale':health.get('state') in ('delayed','error')})
+        if scan_meta:
+            sources.append({'source':'candidate_pool','label':f'{workspace["meta"]["name"]}每日动态候选池',
+                            'as_of':scan_meta.get('refreshed_at'),'stale':scan_meta.get('stale',True)})
+        if stock and stock.get('quote'):
+            sources.append({'source':stock['quote'].get('source'),'label':f'{stock["symbol"]}行情',
+                            'as_of':stock['quote'].get('market_time') or stock.get('analyzed_at'),
+                            'stale':stock.get('data_status') in ('stale','unavailable')})
+        if stock and stock.get('data_profile'):
+            profile=stock['data_profile'];bar_time=profile.get('intraday',{}).get('last_bar_at') or profile.get('daily',{}).get('end')
+            sources.append({'source':stock.get('source'),'label':f'{stock["symbol"]}策略K线','as_of':bar_time,
+                            'stale':stock.get('data_status') in ('stale','unavailable')})
+        for summary in account.get('summaries',[]):
+            sources.append({'source':summary.get('source'),'label':summary.get('source_label')+'账户摘要',
+                            'as_of':summary.get('updated_at'),'stale':bool(summary.get('stale'))})
+        for position_source in account.get('position_sources',[]):
+            sources.append({'source':position_source.get('source'),'label':position_source.get('source_label')+'持仓快照',
+                            'as_of':position_source.get('updated_at'),'stale':bool(position_source.get('stale'))})
+        generated=now().isoformat()
+        result=build_context(question=data['question'].strip(),market=market,generated_at=generated,
+                             workspace=workspace,stock=stock,account=account,included_sources=sources,warnings=warnings,
+                             mode=mode,candidates=candidates,scan_meta=scan_meta)
+        self.store.event('gpt_handoff',{'message':'已生成GPT研究交接','scope':'stock' if symbol else 'market',
+                                        'market':market,'mode':mode,'candidate_count':len(candidates),
+                                        'include_account':bool(data.get('include_account',False)),
+                                        'stale':bool(scan_meta and scan_meta.get('stale')),'generated_at':generated})
+        return result
+
+    def cleanup_gpt_data(self):
+        """Remove same-day raw text after package expiry; keep only review-safe fields."""
+        t=now();changed=False
+        packages=[]
+        for row in self.gpt_packages:
+            expired=bool(row.get('expires_at') and stamp(row['expires_at'])<=t)
+            if expired and row.get('prompt') is not None:
+                row={k:row.get(k) for k in ('package_id','market','mode','trade_date','generated_at','expires_at','symbol')}
+                row.update(status='expired',prompt=None,preview=None,include_account=False,parent_run_id=None,question=None)
+                changed=True
+            packages.append(row)
+        runs=[]
+        for row in self.gpt_runs:
+            expired=bool(row.get('expires_at') and stamp(row['expires_at'])<=t)
+            if expired and (row.get('response_text') is not None or row.get('status')!='expired'):
+                row={k:row.get(k) for k in ('run_id','package_id','market','mode','trade_date','generated_at','expires_at',
+                                             'imported_at','version','digest','candidates','local_validation','result')}
+                row.update(status='expired',active=False,response_text=None,warnings=['研究结果已在收盘后失效；完整问答已清除'])
+                changed=True
+            runs.append(row)
+        self.gpt_packages=packages[-80:];self.gpt_runs=runs[-160:]
+        if changed:
+            self.store.set('gpt_packages',self.gpt_packages);self.store.set('gpt_runs',self.gpt_runs)
+
+    def active_gpt_symbols(self,markets=None):
+        self.cleanup_gpt_data();markets=set(markets or ('CN','US'))
+        active=[]
+        for run in reversed(self.gpt_runs):
+            if run.get('active') and run.get('status')=='validated' and run.get('market') in markets:
+                active.extend(row['symbol'] for row in run.get('candidates',[]) if row.get('verdict')!='不买')
+        return list(dict.fromkeys(active))
+
+    def _gpt_package_record(self,package_id):
+        return next((row for row in reversed(self.gpt_packages) if row.get('package_id')==package_id),None)
+
+    async def gpt_package(self,data,*,parent=None,question=None,parent_run_id=None):
+        market=str(data.get('market','')).upper()
+        if market not in ('CN','US'):raise ValueError('请选择A股或美股市场')
+        requested=str(data.get('mode') or 'auto')
+        mode=resolve_mode(requested,market,now())
+        symbol=str(data.get('symbol') or '').upper().strip() or None
+        if mode=='single_stock' and not symbol:raise ValueError('单股研究需要股票代码')
+        if symbol:
+            if not re.fullmatch(r'[A-Z0-9.\-]{1,16}\.(US|SH|SZ)',symbol) or symbol_market(symbol)!=market:
+                raise ValueError('股票代码与当前市场不匹配')
+            if not self.allowed_security({'symbol':symbol,'name':self.security_map.get(symbol,{}).get('name','')}):
+                raise ValueError('该股票不在本机允许的研究范围')
+        trade_date=self.candidate_trade_date(market);generated=now().isoformat()
+        try:expires=close_time(trade_date,market).isoformat()
+        except Exception:expires=(now()+timedelta(hours=12)).isoformat()
+        candidates,scan_meta=self.gpt_scan_candidates(market,limit=20)
+        if symbol:
+            candidates=[row for row in candidates if row['symbol']==symbol] or [{
+                'rank':1,'symbol':symbol,'name':self.security_map.get(symbol,{}).get('name') or symbol,
+                'industry':'行业未知','decision':'等待本地核验','price':self.quotes.get(symbol).price if self.quotes.get(symbol) else None,
+                'price_time':self.quotes.get(symbol).market_time.isoformat() if self.quotes.get(symbol) and self.quotes.get(symbol).market_time else None,
+            }]
+        account={'included':False,'summaries':[],'positions':[],'omitted_positions':0};warnings=[]
+        if data.get('include_account',False):
+            account,account_warnings=await self.account_context(True);warnings.extend(account_warnings)
+        if scan_meta.get('stale'):warnings.append('本地后备池是过期快照；ChatGPT必须先用Longbridge完成全市场刷新')
+        package_id='gptp_'+uuid4().hex
+        snapshot=self.snapshot();workspace=snapshot['workspaces'][market]
+        prompt=build_package_prompt(package_id=package_id,market=market,trade_date=trade_date,mode=mode,
+                                    generated_at=generated,expires_at=expires,candidates=candidates,workspace=workspace,
+                                    account=account,symbol=symbol,parent=parent,question=question)
+        preview={'market':market,'market_name':workspace['meta']['name'],'mode':mode,'trade_date':trade_date,
+                 'market_phase':workspace['meta']['phase'],'fallback_candidates':candidates,'fallback_count':len(candidates),
+                 'fallback_stale':bool(scan_meta.get('stale')),'account_included':bool(account.get('included')),
+                 'symbol':symbol,'parent_run_id':parent_run_id}
+        record={'package_id':package_id,'market':market,'mode':mode,'trade_date':trade_date,'generated_at':generated,
+                'expires_at':expires,'symbol':symbol,'include_account':bool(account.get('included')),'prompt':prompt,
+                'preview':preview,'status':'ready','parent_run_id':parent_run_id,'question':question}
+        self.gpt_packages.append(record);self.gpt_packages=self.gpt_packages[-80:]
+        self.store.set('gpt_packages',self.gpt_packages)
+        self.store.event('gpt_package',{'message':'已生成GPT选股任务','market':market,'mode':mode,
+                                        'candidate_count':len(candidates),'include_account':bool(account.get('included')),
+                                        'generated_at':generated})
+        return {k:record[k] for k in ('package_id','prompt','preview','generated_at','expires_at')}|{
+            'mode_resolved':mode,'chatgpt_url':LONGBRIDGE_APP_URL,'warnings':warnings,
+            'conversation_url':self.gpt_conversations.get(market)}
+
+    def _public_gpt_run(self,row):
+        return {k:row.get(k) for k in ('run_id','package_id','market','mode','trade_date','generated_at','expires_at',
+                                       'imported_at','version','status','candidates','local_validation','warnings','active')}
+
+    def _local_position_cap(self,market,decision):
+        if not decision or not decision.get('cash_required'):return None
+        account=self.sim.state['accounts'][market]
+        equity=account['cash']+sum(p.get('remaining',0)*p.get('mark',0) for p in account['positions'].values())
+        return round(decision['cash_required']/equity*100,2) if equity>0 else None
+
+    async def validate_gpt_candidate(self,row,mode=None):
+        symbol=row['symbol'];market=symbol_market(symbol)
+        try:analysis=await self.analyze_stock({'symbol':symbol})
+        except Exception:
+            return {'symbol':symbol,'state':'wait','display_status':'GPT精选·等确认','reason':'本地证券、行情或K线刷新未完成',
+                    'gpt_verdict':row['verdict'],'local_price':None,'local_price_time':None,'position_cap_pct':None}
+        quote=analysis.get('quote') or {};price=quote.get('price');final=analysis.get('final') or {}
+        base={'symbol':symbol,'name':analysis.get('name') or row.get('name'),'gpt_verdict':row['verdict'],
+              'local_price':price,'local_price_time':quote.get('market_time'),'checked_at':analysis.get('analyzed_at') or now().isoformat(),
+              'data_status':analysis.get('data_status'),'source':analysis.get('source'),'position_cap_pct':None}
+        def result(state,label,reason):return base|{'state':state,'display_status':label,'reason':reason}
+        if row['verdict']=='不买':return result('avoid','暂不参与','GPT结论为不买；本地不会放宽该结论')
+        if price is None:return result('wait','GPT精选·等确认','本地没有有效实时报价')
+        gpt_age=(now()-stamp(row['price_time'])).total_seconds()
+        if mode=='intraday' and (gpt_age<0 or gpt_age>900):
+            return result('wait','GPT精选·等确认','GPT盘中行情时间已过期，需先刷新外部研究')
+        if quote.get('trade_status')!='Normal':return result('avoid','暂不参与','本地确认停牌或交易状态异常')
+        if row.get('invalidation_price') and price<=row['invalidation_price']:
+            return result('avoid','暂不参与','本地现价已触及GPT失效线')
+        if row.get('no_chase_price') and price>row['no_chase_price']:
+            return result('avoid','暂不参与','本地现价已超过GPT不追价线')
+        if quote.get('limit_up') and price>=quote['limit_up']:
+            return result('avoid','暂不参与','本地确认已触及涨停，不能确认可买')
+        if quote.get('limit_down') and price<=quote['limit_down']:
+            return result('avoid','暂不参与','本地确认已触及跌停或结构失效')
+        if row['verdict']!='买':return result('wait','GPT精选·等确认','GPT结论为等，继续等待确认条件')
+        execution=analysis.get('available_assessments',{}).get('execution')
+        if not execution:return result('wait','GPT精选·等确认','本地实时报价、盘口或市场时段尚未全部通过')
+        if final.get('status')!='BUY' or not final.get('decision'):
+            return result('wait','GPT精选·等确认',final.get('reason') or '本地策略尚未出现有效买点')
+        local_cap=self._local_position_cap(market,final['decision']);gpt_cap=row.get('position_cap_pct')
+        caps=[value for value in (local_cap,gpt_cap) if isinstance(value,(int,float))]
+        base['position_cap_pct']=min(caps) if caps else None
+        base['local_decision']=final['decision']
+        return result('buy','当前可考虑买入','GPT精选且本地行情、盘口、信号与风险检查全部通过')
+
+    async def gpt_import(self,data):
+        self.cleanup_gpt_data();package_id=str(data.get('package_id') or '')
+        package=self._gpt_package_record(package_id)
+        if not package:raise ValueError('找不到这个GPT研究包，请重新生成')
+        response_text=data.get('response_text')
+        if not isinstance(response_text,str):raise ValueError('请粘贴 ChatGPT 的完整文字答案')
+        digest=response_digest(response_text)
+        duplicate=next((row for row in reversed(self.gpt_runs) if row.get('package_id')==package_id and row.get('digest')==digest),None)
+        if duplicate:return self._public_gpt_run(duplicate)
+        imported=now().isoformat();version=1+max((r.get('version',0) for r in self.gpt_runs if r.get('package_id')==package_id),default=0)
+        if package.get('status')=='expired' or stamp(package['expires_at'])<=now():
+            self.store.event('gpt_import',{'message':'GPT结果已过期','market':package['market'],'mode':package['mode'],'candidate_count':0,'status':'expired','generated_at':imported})
+            return {'run_id':None,'status':'expired','candidates':[],'local_validation':[],
+                    'warnings':['研究包已在收盘后失效，请重新生成当日任务']}
+        base={'run_id':'gptr_'+uuid4().hex,'package_id':package_id,'market':package['market'],'mode':package['mode'],
+              'trade_date':package['trade_date'],'generated_at':package['generated_at'],'expires_at':package['expires_at'],
+              'imported_at':imported,'version':version,'digest':digest,'response_text':response_text,'active':False}
+        try:
+            parsed=extract_result(response_text)
+            structured=validate_result(parsed,package)
+        except ValueError as exc:
+            row=base|{'status':'needs_correction','candidates':[],'local_validation':[],'result':None,'warnings':[str(exc)]}
+            self.gpt_runs.append(row);self.gpt_runs=self.gpt_runs[-160:];self.store.set('gpt_runs',self.gpt_runs)
+            self.store.event('gpt_import',{'message':'GPT结果需要修正','market':package['market'],'mode':package['mode'],
+                                           'candidate_count':0,'status':'needs_correction','generated_at':imported})
+            return self._public_gpt_run(row)
+        if (not structured.get('tools_used') or structured.get('unavailable_tools')):
+            for candidate in structured['candidates']:
+                if candidate['verdict']=='买':candidate['verdict']='等'
+        local=[]
+        for candidate in structured['candidates']:local.append(await self.validate_gpt_candidate(candidate,package['mode']))
+        for old in self.gpt_runs:
+            if old.get('market')==package['market'] and old.get('trade_date')==package['trade_date']:old['active']=False
+        warnings=list(structured.get('data_gaps',[]))
+        warnings.extend(f'未完成工具：{item}' for item in structured.get('unavailable_tools',[]))
+        row=base|{'status':'validated','candidates':structured['candidates'],'local_validation':local,
+                  'result':structured,'warnings':warnings,'active':True}
+        self.gpt_runs.append(row);self.gpt_runs=self.gpt_runs[-160:];self.store.set('gpt_runs',self.gpt_runs)
+        self.allocate_monitoring();self.broadcast()
+        self.store.event('gpt_import',{'message':'GPT结果已完成本地复核','market':package['market'],'mode':package['mode'],
+                                       'candidate_count':len(structured['candidates']),'status':'validated','generated_at':imported})
+        return self._public_gpt_run(row)
+
+    async def gpt_followup_package(self,data):
+        self.cleanup_gpt_data();run_id=str(data.get('run_id') or '')
+        run=next((row for row in reversed(self.gpt_runs) if row.get('run_id')==run_id),None)
+        if not run or run.get('status')!='validated':raise ValueError('找不到可继续追问的有效研究结果')
+        if not run.get('active') or stamp(run['expires_at'])<=now():raise ValueError('这轮研究已失效，请重新发起当日扫描')
+        question=str(data.get('question') or '').strip()
+        if not question:raise ValueError('请输入要继续复核的问题')
+        refreshed=[]
+        for candidate in run.get('candidates',[]):refreshed.append(await self.validate_gpt_candidate(candidate,run['mode']))
+        parent={'previous_result':run.get('result'),'latest_local_validation':refreshed,
+                'price_changes':[{'symbol':item['symbol'],'gpt_price':next((c['current_price'] for c in run['candidates'] if c['symbol']==item['symbol']),None),
+                                  'local_price':item.get('local_price'),'local_price_time':item.get('local_price_time')}
+                                 for item in refreshed]}
+        return await self.gpt_package({'market':run['market'],'mode':run['mode'],'symbol':None,'include_account':False},
+                                      parent=parent,question=question,parent_run_id=run_id)
+
+    def gpt_list_runs(self,market):
+        self.cleanup_gpt_data()
+        if market not in ('CN','US'):raise ValueError('请选择A股或美股市场')
+        return {'market':market,'conversation_url':self.gpt_conversations.get(market),
+                'runs':[self._public_gpt_run(row) for row in reversed(self.gpt_runs) if row.get('market')==market][:30]}
+
+    def save_gpt_conversation(self,market,url):
+        if market not in ('CN','US'):raise ValueError('请选择A股或美股市场')
+        clean=valid_chatgpt_url(url)
+        if clean:self.gpt_conversations[market]=clean
+        else:self.gpt_conversations.pop(market,None)
+        self.store.set('gpt_conversations',self.gpt_conversations)
+        return {'market':market,'conversation_url':clean}
+
     def market_workspace(self,market,rows,simulation,alerts):
         """One self-contained market payload for the decision-first UI."""
         suffix=lambda symbol:symbol_market(symbol)==market
@@ -1292,7 +1804,8 @@ class Dashboard:
         swing=[r['symbol'] for r in sorted(self.selection,key=lambda r:(-(r.get('rs_percentile') or 0),r.get('atr_contraction') or 999,r['symbol']))
                if r.get('market') in markets and r.get('decision')!='暂不参与' and r.get('atr_contraction') is not None]
         fallback=[r['symbol'] for r in self.selection if r.get('market') in markets and r['decision']!='暂不参与']
-        desired=list(dict.fromkeys(self.real.symbols()+held+pending+self.manual_watch+picks+swing+fallback+[s for s in self.watch if symbol_market(s) in markets]))[:self.settings['monitor_limit']]
+        gpt=self.active_gpt_symbols(markets)
+        desired=list(dict.fromkeys(self.real.symbols()+held+self.manual_watch+pending+gpt+picks+swing+fallback+[s for s in self.watch if symbol_market(s) in markets]))[:self.settings['monitor_limit']]
         if desired and desired!=self.watch:
             self.watch=desired;self.store.set('watch',desired);self.first_poll=True
 
@@ -1327,17 +1840,14 @@ class Dashboard:
             await asyncio.sleep(300)
 
     def premarket(self,market):
-        current=local_date(now(),market);cal=calendar(market)
-        try:
-            if cal.is_session(str(current)) and phase(now(),market)!='已收盘':target=current
-            elif cal.is_session(str(current)):target=cal.next_session(str(current)).date()
-            else:target=cal.date_to_session(str(current),direction='next').date()
-        except Exception:target=current
         rows=[dict(r) for r in self.selection if r.get('market')==market and r.get('decision')!='暂不参与']
-        rows.sort(key=selection_rank)
+        rows=diversified_rank(rows,10)
+        core=self.daily_core.get(market,{})
         result=[]
-        for index,row in enumerate(rows[:10],1):
-            result.append({**row,'rank':index,'trade_date':str(target),'entry_status':'等待盘中确认',
+        for index,row in enumerate(rows,1):
+            result.append({**row,'rank':index,'industry':row.get('industry') or '行业未知',
+                           'trade_date':self.candidate_trade_date(market),'pool_updated_at':core.get('updated_at'),
+                           'pool_stale':bool(core.get('stale')),'entry_status':'等待盘中确认',
                            'monitored':row['symbol'] in self.tracked(),
                            'quote_time':self.quotes.get(row['symbol']).market_time.isoformat() if self.quotes.get(row['symbol']) and self.quotes[row['symbol']].market_time else None})
         return result
@@ -1429,7 +1939,7 @@ class Dashboard:
         self.real_plans=real_plans
 
     async def live_loop(self):
-        tick=time.monotonic();next_poll=0.
+        tick=time.monotonic();next_poll=0.;next_evaluation=0.
         while self.alive:
             try:
                 current=time.monotonic()
@@ -1445,9 +1955,9 @@ class Dashboard:
                             if s in self.details:
                                 self.details[s]['preview']=self.strategies.preview(s)
                                 self.details[s]['reason']=self.strategies.preview(s).get('reason','等待确认')
-                    self.evaluate_decisions();self.close_reports()
+                    if current>=next_evaluation:
+                        self.evaluate_decisions();self.close_reports();self.broadcast();next_evaluation=current+5
                 self.tasks=[x for x in self.tasks if not x.done()]
-                self.broadcast()
             except asyncio.CancelledError:raise
             except Exception as exc:self.store.event('monitor',{'message':'本轮决策检查未完成','error_type':type(exc).__name__})
             await asyncio.sleep(1)

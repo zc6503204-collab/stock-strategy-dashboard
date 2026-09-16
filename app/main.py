@@ -1,8 +1,9 @@
 import asyncio,json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 from fastapi import FastAPI,HTTPException,Request
-from fastapi.responses import FileResponse,StreamingResponse
+from fastapi.responses import FileResponse,StreamingResponse,Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel,Field
@@ -10,6 +11,13 @@ from .service import Dashboard
 from .providers import ROOT
 
 dashboard=Dashboard()
+
+class LocalStaticFiles(StaticFiles):
+    """Keep small local assets in one chunk even while broker refreshes are busy."""
+    async def get_response(self,path,scope):
+        response=await super().get_response(path,scope)
+        if isinstance(response,FileResponse):response.chunk_size=1024*1024
+        return response
 
 @asynccontextmanager
 async def lifespan(app):
@@ -39,7 +47,13 @@ async def local_only(request:Request,call_next):
 @app.get('/')
 async def index():return FileResponse(ROOT/'web/index.html')
 
-app.mount('/assets',StaticFiles(directory=str(ROOT/'web')),name='assets')
+@app.get('/assets/app.js')
+async def app_javascript():return Response((ROOT/'web/app.js').read_bytes(),media_type='text/javascript')
+
+@app.get('/assets/style.css')
+async def app_styles():return Response((ROOT/'web/style.css').read_bytes(),media_type='text/css')
+
+app.mount('/assets',LocalStaticFiles(directory=str(ROOT/'web')),name='assets')
 
 @app.get('/api/state')
 async def state():return dashboard.snapshot()
@@ -203,6 +217,62 @@ async def analyze(body:AnalyzeRequest):
     try:return await dashboard.analyze_stock(body.model_dump(exclude_none=True))
     except ValueError as e:raise HTTPException(400,str(e))
 
+class GPTContextRequest(BaseModel):
+    question:str=Field(min_length=1,max_length=2000)
+    market:str
+    symbol:str|None=Field(default=None,max_length=20)
+    include_account:bool=False
+    refresh:bool=True
+    mode:Literal['research','market_scan']='research'
+
+@app.post('/api/gpt/context')
+async def gpt_context(body:GPTContextRequest):
+    try:return await dashboard.gpt_context(body.model_dump())
+    except ValueError as e:raise HTTPException(400,str(e))
+
+class GPTPackageRequest(BaseModel):
+    market:str
+    mode:Literal['auto','premarket','intraday','single_stock']='auto'
+    symbol:str|None=Field(default=None,max_length=20)
+    include_account:bool=False
+
+class GPTImportRequest(BaseModel):
+    package_id:str=Field(min_length=1,max_length=80)
+    response_text:str=Field(min_length=1,max_length=102400)
+
+class GPTFollowupRequest(BaseModel):
+    run_id:str=Field(min_length=1,max_length=80)
+    question:str=Field(min_length=1,max_length=2000)
+
+class GPTConversationRequest(BaseModel):
+    market:str
+    url:str=Field(default='',max_length=2048)
+
+@app.post('/api/gpt/package')
+async def gpt_package(body:GPTPackageRequest):
+    try:return await dashboard.gpt_package(body.model_dump())
+    except ValueError as e:raise HTTPException(400,str(e))
+
+@app.post('/api/gpt/import')
+async def gpt_import(body:GPTImportRequest):
+    try:return await dashboard.gpt_import(body.model_dump())
+    except ValueError as e:raise HTTPException(400,str(e))
+
+@app.post('/api/gpt/followup-package')
+async def gpt_followup(body:GPTFollowupRequest):
+    try:return await dashboard.gpt_followup_package(body.model_dump())
+    except ValueError as e:raise HTTPException(400,str(e))
+
+@app.get('/api/gpt/runs')
+async def gpt_runs(market:str='CN'):
+    try:return dashboard.gpt_list_runs(market.upper())
+    except ValueError as e:raise HTTPException(400,str(e))
+
+@app.post('/api/gpt/conversation')
+async def gpt_conversation(body:GPTConversationRequest):
+    try:return dashboard.save_gpt_conversation(body.market.upper(),body.url)
+    except ValueError as e:raise HTTPException(400,str(e))
+
 @app.post('/api/analyze/add-monitoring')
 async def analyze_add_monitoring(body:Watch):
     try:return await dashboard.add_watch(body.symbol)
@@ -210,8 +280,7 @@ async def analyze_add_monitoring(body:Watch):
 
 @app.post('/api/scan')
 async def scan():
-    if not dashboard.scanning:
-        task=asyncio.create_task(dashboard.scan(force_strategy=True));dashboard.tasks.append(task)
+    if not dashboard.scanning:dashboard.request_scan(force_strategy=True,rebuild_markets=['CN','US'])
     return {'ok':True}
 
 @app.post('/api/settings')
