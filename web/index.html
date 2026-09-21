@@ -4,10 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23356859'/%3E%3Ctext x='16' y='23' text-anchor='middle' fill='white' font-size='23'%3ES%3C/text%3E%3C/svg%3E">
   <title>短线观察台 · 双市场工作区</title>
   <script>if(location.protocol==='file:')location.replace('http://127.0.0.1:8765/'+location.search+location.hash)</script>
-  <link rel="stylesheet" href="/assets/style.css?v=8">
-  <script src="/assets/app.js?v=8" defer></script>
+  <link rel="stylesheet" href="/assets/style.css?v=9">
+  <script src="/assets/app.js?v=9" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -15,7 +16,7 @@
     <div class="workspace-tag"><i></i><span id="sidebar-market">A股工作区</span></div>
     <nav aria-label="工作区页面">
       <button data-view="today" data-label="决策" class="active"><span>◉</span>今日决策</button>
-      <button data-view="premarket" data-label="盘前"><span>▤</span>盘前观察</button>
+      <button data-view="premarket" data-label="研究"><span>▤</span>动态研究池</button>
       <button data-view="holdings" data-label="持仓"><span>◆</span>持仓管理</button>
       <button data-view="review" data-label="复盘"><span>◷</span>复盘研究</button>
       <button data-view="strategies" data-label="策略"><span>⌁</span>策略中心</button>
@@ -39,25 +40,26 @@
     <div class="content">
       <section class="page" id="today">
         <div class="page-title">
-          <div><span class="kicker" id="today-kicker">A股 · 今日决策</span><h1 id="today-title">先看结论，再决定是否行动</h1><p id="today-subtitle">只展示当前市场的买入机会和必须处理的持仓。</p></div>
-          <div class="title-actions"><button class="secondary" data-ask-gpt="market">问 GPT</button><button class="secondary" data-go="premarket">查看盘前名单 →</button></div>
+          <div><span class="kicker" id="today-kicker">A股 · 今日决策</span><h1 id="today-title">动态选股与买卖计划</h1><p id="today-subtitle">持续发现池外机会，给出买入区间，并在买后跟踪退出。</p></div>
+          <div class="title-actions"><button class="secondary" data-ask-gpt="market">问 GPT</button><button class="secondary" data-go="premarket">查看动态研究池 →</button></div>
         </div>
         <div class="health-strip" id="health-strip"></div>
-        <section class="panel" id="auto-research-panel"></section>
         <section id="decision-hero" class="decision-hero"></section>
         <div class="decision-layout">
           <section class="primary-slot" id="primary-decision"></section>
-          <aside class="backup-column"><div class="section-label"><b>备选位置</b><span>最多2只</span></div><div id="backup-decisions"></div></aside>
+          <aside class="backup-column"><div class="section-label"><b>其他当前可买</b><span>最多2只</span></div><div id="backup-decisions"></div></aside>
         </div>
+        <section class="panel waiting-plans-panel"><div class="panel-head"><div><span class="kicker">有结构，等确认</span><h2>等待触发与执行核验</h2><p>未通过全部条件的计划不会进入当前可买区。</p></div><span id="waiting-plans-count"></span></div><div class="waiting-plan-grid" id="waiting-plans"></div></section>
         <div class="lower-grid">
-          <section class="panel"><div class="panel-head"><div><span class="kicker">真实持仓</span><h2>需要立即处理</h2></div><button class="text-button" data-go="holdings">全部持仓 →</button></div><div id="holding-actions"></div></section>
+          <section class="panel"><div class="panel-head"><div><span class="kicker">买后持续跟踪</span><h2>持仓卖出计划</h2></div><button class="text-button" data-go="holdings">全部持仓 →</button></div><div id="holding-actions"></div></section>
           <section class="panel"><div class="panel-head"><div><span class="kicker">等待条件</span><h2>现在为什么不买</h2></div></div><div id="waiting-reasons"></div></section>
         </div>
+        <section class="panel" id="auto-research-panel"></section>
         <section class="panel alerts-panel"><div class="panel-head"><div><span class="kicker">本地提醒</span><h2>最近触发</h2></div></div><div id="market-alerts"></div></section>
       </section>
 
       <section class="page hidden" id="premarket">
-        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>A股分页更新基础证券库，按策略复核后形成动态研究池；盘中继续发现池外候选。观察名单不等于买点。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="scan">让 GPT 深研今日候选</button><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div></div>
+        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 动态研究池</span><h1>全范围发现，候选动态更换</h1><p>A股分页更新基础证券库，按策略复核后形成动态研究池；盘中继续发现池外候选。观察名单不等于买点。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="scan">让 GPT 深研今日候选</button><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div></div>
         <div class="health-strip compact" id="premarket-summary"></div>
         <div class="scope-note" id="premarket-scope"></div>
         <div class="screener-layout">
@@ -72,10 +74,11 @@
       </section>
 
       <section class="page hidden" id="holdings">
-        <div class="page-title"><div><span class="kicker" id="holdings-kicker">A股 · 持仓管理</span><h1>持仓和退出计划</h1><p>真实持仓与模拟持仓分开显示；所有真实交易仍由你自行决定和下单。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="account">持仓复盘问 GPT</button><button class="secondary" id="sync-holdings">同步券商持仓</button><button class="primary" id="add-holding">＋ 手工录入</button></div></div>
+        <div class="page-title"><div><span class="kicker" id="holdings-kicker">A股 · 持仓管理</span><h1>持仓和退出计划</h1><p>真实持仓与模拟持仓分开显示；所有真实交易仍由你自行决定和下单。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="account">持仓复盘问 GPT</button><button class="secondary" id="sync-holdings">主动读取券商持仓</button><button class="text-button hidden" id="stop-broker-sync">关闭账户同步</button><button class="primary" id="add-holding">＋ 手工录入</button></div></div>
         <div class="health-strip compact" id="holding-summary"></div>
         <div class="tab-switch" id="holding-kind"><button data-holding-kind="real" class="selected">真实持仓</button><button data-holding-kind="paper">模拟持仓</button></div>
         <section class="panel"><div class="table-wrap" id="holdings-content"></div></section>
+        <details class="panel manual-ledger"><summary>我的手动成交账本</summary><div id="manual-history"><p class="form-hint">登记实际卖出后保留成交价格、费用和已实现盈亏。</p></div></details>
       </section>
 
       <section class="page hidden" id="review">
@@ -167,6 +170,17 @@
       <div class="form-grid"><label>股票代码<input id="holding-symbol" required maxlength="20" placeholder="600519.SH / AAPL.US"></label><label>股票名称<input id="holding-name" maxlength="80" placeholder="可选"></label><label>持仓数量<input id="holding-quantity" required type="number" min="0.0001" step="any"></label><label>买入均价<input id="holding-cost" required type="number" min="0.0001" step="any"></label><label>买入日期<input id="holding-date" type="date"></label><label>保护价<input id="holding-stop" type="number" min="0.0001" step="any"></label><label>止盈参考<input id="holding-target" type="number" min="0.0001" step="any"></label><label class="wide">备注<input id="holding-note" maxlength="300" placeholder="仓位目的、需要提醒的事项"></label></div>
       <p class="form-hint">保护价低于成本时，未填写止盈价会按两倍初始价格风险计算。券商同步持仓只能编辑保护计划。</p>
       <div class="dialog-actions"><button type="button" class="danger-button hidden" id="remove-holding">删除手工记录</button><span></span><button type="button" class="secondary" data-close="holding-dialog">取消</button><button type="submit" class="primary">保存计划</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="execution-dialog">
+    <form id="execution-form" class="dialog-card">
+      <div class="dialog-head"><div><span class="kicker">本机成交记录</span><h2 id="execution-title">登记实际买入</h2></div><button type="button" class="close-button" data-close="execution-dialog" aria-label="关闭">×</button></div>
+      <div id="execution-summary" class="execution-summary"></div>
+      <div class="form-grid"><label>实际成交数量（股）<input id="execution-quantity" required type="number" min="0.0001" step="any"></label><label>实际成交均价<input id="execution-price" required type="number" min="0.0001" step="any"></label><label>实际成交时间（本机时区）<input id="execution-time" required type="datetime-local"></label><label>本笔实际费用<input id="execution-fee" required type="number" min="0" step="0.01" value="0"></label><label class="wide">备注<input id="execution-note" maxlength="300" placeholder="例如：分批成交的实际均价"></label></div>
+      <p class="form-hint">只登记你已在券商完成的成交，不提交订单，也不开启账户读取。请按实际成交填写费用；原计划价格与风险条件会保留。</p>
+      <p class="execution-feedback" id="execution-feedback" role="status"></p>
+      <div class="dialog-actions"><span></span><span></span><button type="button" class="secondary" data-close="execution-dialog">取消</button><button type="submit" class="primary" id="execution-submit">确认记录已实际买入</button></div>
     </form>
   </dialog>
 

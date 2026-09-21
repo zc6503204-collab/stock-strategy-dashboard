@@ -20,7 +20,7 @@ def _position_defaults(position):
     return position
 
 
-def _metrics(trades,failures=()):
+def _metrics(trades,failures=(),curve=None):
     trades=sorted(trades,key=lambda t:t.get('exit_time',''))
     values=[float(t.get('net_pnl',0)) for t in trades];wins=[v for v in values if v>0];losses=[-v for v in values if v<0]
     count=len(values);rate=len(wins)/count if count else None
@@ -33,6 +33,12 @@ def _metrics(trades,failures=()):
     for value in values:
         streak=streak+1 if value<0 else 0;longest=max(longest,streak)
         equity+=value;peak=max(peak,equity);drawdown=max(drawdown,(peak-equity)/peak if peak else 0)
+    basis='已结束交易净值'
+    if curve:
+        peak=100000.;drawdown=0.
+        for point in sorted(curve,key=lambda x:x['time']):
+            peak=max(peak,point['equity']);drawdown=max(drawdown,(peak-point['equity'])/peak if peak else 0)
+        basis='含未平仓及部分止盈的盯市净值'
     regimes={}
     for trade in trades:
         regime=trade.get('market_regime') or trade.get('evidence',{}).get('market_regime') or '未分类'
@@ -43,11 +49,11 @@ def _metrics(trades,failures=()):
             'profit_factor':sum(wins)/sum(losses) if losses else None,
             'payoff':(sum(wins)/len(wins))/(sum(losses)/len(losses)) if wins and losses else None,
             'average_win':sum(wins)/len(wins) if wins else None,'average_loss':sum(losses)/len(losses) if losses else None,
-            'expectancy':sum(values)/count if count else None,'max_drawdown':drawdown*100,'loss_streak':longest,
+            'expectancy':sum(values)/count if count else None,'max_drawdown':drawdown*100,'drawdown_basis':basis,'loss_streak':longest,
             'double_cost_pnl':sum(t.get('double_cost_pnl',t.get('net_pnl',0)) for t in trades),
             'avg_holding':sum(t.get('holding_sessions',0) for t in trades)/count if count else None,
             'failed_fills':len(list(failures)),'enough':count>=30,
-            'stability':'样本相对稳定' if count>=100 else '可初步比较' if count>=30 else '样本不足',
+            'stability':'达到100笔，仍需独立样本与样本外验证' if count>=100 else '可初步比较' if count>=30 else '样本不足',
             'risk_groups':{g:{'count':sum(t.get('risk_group')==g for t in trades),'net_pnl':sum(t.get('net_pnl',0) for t in trades if t.get('risk_group')==g)} for g in ['normal','smallcap','st']},
             'market_regimes':regimes}
 
@@ -62,13 +68,13 @@ class Simulation:
 
     def _migrate(self):
         self.state.setdefault('accounts',{m:{'cash':100000.,'positions':{},'trades':[],'curve':[]} for m in ['CN','US']})
-        self.state.setdefault('pending',{});self.state.setdefault('seen',[]);self.state.setdefault('processed',{})
+        self.state.setdefault('filled_structures',[]);self.state.setdefault('pending',{});self.state.setdefault('seen',[]);self.state.setdefault('processed',{})
         self.state.setdefault('failures',[]);self.state.setdefault('shadow',{})
         params=dict(DEFAULTS);params.update(self.state.get('params',{}));self.state['params']=params
         for account in self.state['accounts'].values():
             account.setdefault('cash',100000.);account.setdefault('positions',{});account.setdefault('trades',[]);account.setdefault('curve',[])
             for position in account['positions'].values():_position_defaults(position)
-        shadow=self.state['shadow'];shadow.setdefault('pending',{});shadow.setdefault('seen',[]);shadow.setdefault('processed',{})
+        shadow=self.state['shadow'];shadow.setdefault('filled_structures',[]);shadow.setdefault('pending',{});shadow.setdefault('seen',[]);shadow.setdefault('processed',{})
         shadow.setdefault('books',{});shadow.setdefault('failures',[])
         for book in shadow['books'].values():
             book.setdefault('positions',{});book.setdefault('trades',[]);book.setdefault('curve',[])
@@ -83,12 +89,12 @@ class Simulation:
         if not target or target[-1]!=item:target.append(item);del target[:-500]
 
     def queue(self,signal):
-        if signal.id in self.state['seen']:return
+        if signal.id in self.state['seen'] or signal.evidence.get('structure_id') in self.state['filled_structures']:return
         self.state['seen'].append(signal.id);self.state['pending'][signal.id]=signal.dump();self.save()
 
     def queue_shadow(self,signal):
         shadow=self.state['shadow']
-        if signal.id in shadow['seen']:return
+        if signal.id in shadow['seen'] or signal.evidence.get('structure_id') in shadow['filled_structures']:return
         shadow['seen'].append(signal.id);shadow['pending'][signal.id]=signal.dump();self.save()
 
     def cancel_pending(self,symbol,reason):
@@ -145,7 +151,7 @@ class Simulation:
         no_chase=signal.trigger+float(signal.evidence.get('no_chase_risk_fraction',.25))*(signal.trigger-signal.stop)
         if price>no_chase:
             self.fail(signal.symbol,'跳空／滑点超过不追价上限',bar.start,signal.strategy,signal.version,ledger);return None
-        if price>bar.high or (bar.limit_up and price>bar.limit_up):
+        if price<bar.low or price>bar.high or (bar.limit_up and price>=bar.limit_up):
             self.fail(signal.symbol,'假设成交价超出K线／涨停价，未成交',bar.start,signal.strategy,signal.version,ledger);return None
         return approval,slip,price
 
@@ -170,7 +176,9 @@ class Simulation:
         if qty<lot:self.fail(signal.symbol,'风险预算、现金或成交量不足一手',bar.start,signal.strategy,signal.version);return
         fee=qty*price*cfg['fee_rate'];account['cash']-=qty*price+fee
         position=self._new_position(signal,bar,price,qty,sizing['planned_risk'] if sizing else qty*unit,fee,qty*(price-bar.open))
-        account['positions'][signal.symbol]=position;self.exit_position(account,position,bar,market,signal.symbol)
+        account['positions'][signal.symbol]=position
+        if signal.evidence.get('structure_id'):self.state['filled_structures'].append(signal.evidence['structure_id'])
+        self.exit_position(account,position,bar,market,signal.symbol)
 
     def _new_position(self,signal,bar,price,qty,planned_risk,fee,slippage_cost):
         policy=dict(signal.evidence.get('exit_policy') or {'type':'risk_partial','target_r':2,'trail':'intraday_3bar'})
@@ -178,7 +186,7 @@ class Simulation:
         if policy.get('type')=='orb_fixed' and signal.evidence.get('opening_range'):
             width=float(signal.evidence['opening_range']);stop=price-float(policy.get('stop_range',.5))*width
             target=price+float(policy.get('target_range',.75))*width
-        else:target=float(signal.evidence.get('target_price',price+float(policy.get('target_r',2))*(price-stop)))
+        else:target=float(signal.evidence.get('target_price',signal.evidence.get('approval',{}).get('target',price+float(policy.get('target_r',2))*(price-stop))))
         return _position_defaults({'id':signal.id,'symbol':signal.symbol,'source':signal.source,'strategy':signal.strategy,
             'risk_group':signal.risk_group,'version':signal.version,'entry':price,
             'entry_time':signal.evidence.get('approval',{}).get('time',bar.start.isoformat()),'qty':qty,'remaining':qty,
@@ -209,7 +217,9 @@ class Simulation:
             qty=min(int(approval.get('qty',0)),capacity) if approval else 0;qty=floor(qty/lot)*lot
             if qty<lot:self.fail(signal.symbol,'影子成交量容量不足',bar.start,signal.strategy,signal.version,'shadow');continue
             fee=qty*price*self.state['params']['fee_rate'];position=self._new_position(signal,bar,price,qty,approval.get('planned_risk',qty*(price-signal.stop)),fee,qty*(price-bar.open))
-            book['positions'][sid]=position;self.exit_position(book,position,bar,market,sid)
+            book['positions'][sid]=position
+            if signal.evidence.get('structure_id'):shadow['filled_structures'].append(signal.evidence['structure_id'])
+            self.exit_position(book,position,bar,market,sid)
         for book in shadow['books'].values():self._mark_shadow(book,bar)
 
     def _roll_daily_trail(self,position,bar,market):
@@ -226,7 +236,7 @@ class Simulation:
         position=_position_defaults(position);position['mark']=bar.close;self._roll_daily_trail(position,bar,market)
         day=local_date(bar.start,market);entry_day=local_date(stamp(position['entry_time']),market);held=session_count(entry_day,day,market)
         policy=position.get('exit_policy',{});kind=policy.get('type','risk_partial');maximum=int(position.get('max_hold_sessions',3))
-        due=held>maximum or (held==maximum and bar.end>=close_time(day,market))
+        due=held>maximum or (held==maximum and bar.end>=close_time(day,market)-timedelta(minutes=int(policy.get('time_exit_minutes_before_close',10 if market=='CN' else 0))))
         if kind=='orb_fixed':due=bar.end>=close_time(day,market)-timedelta(minutes=int(policy.get('flat_minutes_before_close',10)))
         reason=position.get('pending_exit');exit_price=bar.open if reason else None;qty=position['remaining']
         if bar.low<=position['stop']:reason='止损／跟踪止损';exit_price=min(bar.open,position['stop'])
@@ -275,8 +285,8 @@ class Simulation:
         else:curve.append(point)
 
     def _mark_shadow(self,book,bar):
-        if not any(p['symbol']==bar.symbol for p in book['positions'].values()):return
-        closed=sum(t.get('net_pnl',0) for t in book['trades']);open_pnl=sum((p['mark']-p['entry'])*p['remaining']-p['fees'] for p in book['positions'].values())
+        if not any(p['symbol']==bar.symbol for p in book['positions'].values()) and not any(t['symbol']==bar.symbol for t in book['trades']):return
+        closed=sum(t.get('net_pnl',0) for t in book['trades']);open_pnl=sum(p.get('realized',0)+(p['mark']-p['entry'])*p['remaining']-p['fees'] for p in book['positions'].values())
         point={'time':bar.end.isoformat(),'equity':round(100000+closed+open_pnl,2)};curve=book['curve']
         if curve and curve[-1]['time']==point['time']:curve[-1]=point
         else:curve.append(point)
@@ -286,7 +296,7 @@ class Simulation:
         for market,account in self.state['accounts'].items():
             equity=account['cash']+sum(p['remaining']*p['mark'] for p in account['positions'].values());peak=100000.;dd=0.
             for point in sorted(account['curve'],key=lambda x:x['time']):peak=max(peak,point['equity']);dd=max(dd,(peak-point['equity'])/peak)
-            ids=['breakout','pullback','trend_pullback','volatility_breakout','trend_rsi_pullback','vcp_swing','orb20_us']
+            ids=['breakout','pullback','trend_pullback','volatility_breakout','trend_rsi_pullback','first_pullback','vcp_swing','orb20_us']
             groups={}
             for strategy in ids:
                 trades=[t for t in account['trades'] if t.get('strategy')==strategy and (version is None or t.get('version','实验 1.0.0')==version)]
@@ -305,7 +315,7 @@ class Simulation:
             if market and book['market']!=market:continue
             failures=[f for f in self.state['shadow']['failures'] if f.get('strategy')==book['strategy'] and f.get('version')==book['version']
                       and symbol_market(f.get('symbol',''))==book['market']]
-            result[book['market']].setdefault(book['strategy'],{})[book['version']]={**_metrics(book['trades'],failures),'positions':list(book['positions'].values())}
+            result[book['market']].setdefault(book['strategy'],{})[book['version']]={**_metrics(book['trades'],failures,book.get('curve')),'positions':list(book['positions'].values())}
         return result
 
     def performance(self,market,strategy,version):

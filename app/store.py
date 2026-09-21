@@ -37,6 +37,11 @@ class Store:
             rows=self.db.execute('SELECT body FROM bars WHERE symbol=? AND source=? ORDER BY time DESC LIMIT ?',(symbol,source,limit)).fetchall()
             return [json.loads(r[0]) for r in rows[::-1]]
 
+    def bars_many(self,bars):
+        with self.lock,self.db:
+            self.db.executemany('INSERT OR IGNORE INTO bars VALUES (?,?,?,?)',
+                [(b.symbol,b.source,b.start.isoformat(),json.dumps(b.dump())) for b in bars])
+
     def signal(self,s):
         with self.lock,self.db:
             cursor=self.db.execute('INSERT OR IGNORE INTO signals VALUES (?,?,?)',(s.id,s.time.isoformat(),json.dumps(s.dump(),ensure_ascii=False)))

@@ -5,9 +5,15 @@ from .models import symbol_market
 VERSION='选股 1.0'
 
 DECISION_ORDER={'重点观察':0,'等确认':1,'暂不参与':2}
+SETUP_ORDER={'confirmed':0,'forming':1,'watch':2,'unavailable':3,'invalid':4}
+
+def priority_class(row):
+    return (SETUP_ORDER.get(row.get('setup_stage','watch'),2) if row.get('market')=='CN' else 0,
+            DECISION_ORDER[row['decision']])
 
 def ranking_key(row):
-    return (DECISION_ORDER[row['decision']],0 if row.get('candidate_strategies') else 1,-row['score'],abs(row['distance_to_high_pct']))
+    return (*priority_class(row),-row.get('discovery_priority',0),0 if row.get('candidate_strategies') else 1,-row['score'],
+            abs(row.get('intraday_distance_to_trigger_pct',row.get('intraday_distance_to_high_pct',row.get('distance_to_high_pct',0)))),row.get('symbol',''))
 
 def diversified_rank(rows,limit=10):
     """Softly diversify display picks without excluding a high-scoring industry."""
@@ -79,10 +85,12 @@ def evaluate(row,bars):
     return {'symbol':row['symbol'],'name':row['name'],'market':symbol_market(b.symbol),
       'industry':str(row.get('industry') or '').strip() or None,
       'score':score,'decision':decision,'reason':reason,'source':b.source,
+      'hard_veto':abnormal or not liquid,
       'as_of':str(local_date(b.start,symbol_market(b.symbol))),
       'close':b.close,'previous_high':b.high,'breakout_reference':ceiling,'structure_low':stop,
       'ma5':m5,'ma10':m10,'ma20':m20,'ma60':m60,'ma20_rising':m20>old20,
       'trend':trend,'stacked':stacked,'average_turnover':amount,'volume_ratio':ratio,
+      'average_volume':sum(x.volume for x in bars[-20:])/20,
       'distance_to_high_pct':distance,'extension_atr':extension,'atr_pct':atr/b.close*100,
       'atr5':atr5,'atr20':atr,'atr_contraction':atr5/atr if atr else None,
       'high10':max(x.high for x in bars[-10:]),'high20':ceiling,'high60':max(x.high for x in bars[-60:]),

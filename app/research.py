@@ -5,8 +5,9 @@ from hashlib import sha256
 from zoneinfo import ZoneInfo
 
 from .models import Signal, symbol_market
-from .calendars import local_date, open_time, is_open
+from .calendars import local_date, open_time, is_open, adjacent
 from .strategy_registry import StrategyRegistry, DEFINITIONS
+from .plan_rules import tick_price
 
 VERSION = '实验 2.0.0'
 BENCHMARKS = {'CN': '000300.SH', 'US': 'SPY.US'}
@@ -28,10 +29,10 @@ def _atr(bars, period):
 
 def daily_factors(symbol, bars, benchmark, fast=20, slow=None, liquidity_min=None, rs_min=0):
     required=max(25,fast+5,(slow or 0)+5)
-    if len(bars)<required or len(benchmark)<21:return {'eligible':False,'reason':'等待股票和基准完整日线'}
+    if len(bars)<required or len(benchmark)<21:return {'eligible':False,'data_ready':False,'reason':'等待股票和基准完整日线'}
     market=symbol_market(symbol);dates={local_date(b.start,market):b for b in benchmark}
     if any(local_date(b.start,market) not in dates for b in bars[-21:]):
-        return {'eligible':False,'reason':'股票与基准日线日期不一致'}
+        return {'eligible':False,'data_ready':False,'reason':'股票与基准日线日期不一致'}
     closes=[b.close for b in bars];recent=bars[-20:]
     mean=sum(closes[-fast:])/fast;old=sum(closes[-fast-5:-5])/fast
     trend=closes[-1]>mean>old
@@ -43,7 +44,7 @@ def daily_factors(symbol, bars, benchmark, fast=20, slow=None, liquidity_min=Non
     rs=(closes[-1]/closes[-21]-last.close/first.close)*100
     threshold=liquidity_min if liquidity_min is not None else (1e8 if market=='CN' else 5e6)
     liquid=amount>=threshold;eligible=trend and liquid and rs>rs_min
-    return {'eligible':eligible,'trend':trend,'relative_strength':rs,'atr':atr,
+    return {'eligible':eligible,'data_ready':True,'trend':trend,'relative_strength':rs,'atr':atr,
             'average_turnover':amount,'ma_fast':mean,'ma_slow':slow_value,
             'reason':'日线与相对强弱通过' if eligible else '等待趋势向上、流动性及跑赢基准同时成立'}
 
@@ -129,6 +130,21 @@ class ResearchEngine:
                   'horizon':definition['horizon'],'max_hold_sessions':definition['max_hold_sessions'],
                   'exit_policy':extra.get('exit_policy',definition['exit_policy']),'research_reference':definition['research_reference'],
                   'market_regime':'基准强势' if extra.get('benchmark_vwap') else '未分类'}
+        if market=='CN':
+            stop=tick_price(stop,.01)
+            day=local_date(b.start,market)
+            deadline=open_time(day,market)+timedelta(hours=5,minutes=15)
+            anchor=extra.get('structure_anchor') or f.get('structure_anchor') or str(day)
+            identity=f'{b.symbol}|{strategy}|{version}|{anchor}'
+            target=tick_price(float(extra.get('target_price',b.close+2*(b.close-stop))),.01)
+            evidence.update(structure_id=sha256(identity.encode()).hexdigest()[:24],structure_anchor=anchor,
+                            structural_stop=stop,entry_deadline=deadline.isoformat(),target_price=target,
+                            targets=[{'price':target,'portion':.5,'reason':'首个结构目标或2R目标'},
+                                     {'price':None,'portion':.5,'reason':'按结构保护价跟踪退出'}],
+                            price_tick=.01,no_chase_risk_fraction=.25,min_net_rr=1.5,
+                            setup='S04' if strategy in ('first_pullback','trend_pullback','trend_rsi_pullback','pullback') else 'S01',
+                            requirements=['市场状态通过','板块持续性通过','重大事件核验通过'],
+                            entry_rule_version='structure-plan-1')
         return Signal(sid,b.symbol,strategy,b.source,b.end,b.close,stop,group,evidence,version)
 
     def _daily(self,symbol,strategy):
@@ -139,12 +155,64 @@ class ResearchEngine:
             return daily_factors(symbol,ctx.get('daily_bars',[]),ctx.get('benchmark_daily',[]),p['daily_ma'],None,p['liquidity_min'],p['relative_strength_min'])
         if strategy=='trend_rsi_pullback':return self._trend_rsi_daily(symbol,p)
         if strategy=='vcp_swing':return self._vcp_daily(symbol,p)
+        if strategy=='first_pullback':return self._first_pullback_daily(symbol,p)
         return ctx['daily']
+
+    def _first_pullback_daily(self,symbol,p):
+        """A daily breakout's first, still-unresolved pullback, never a second leg."""
+        ctx=self.context[symbol];bars=ctx.get('daily_bars',[]);benchmark=ctx.get('benchmark_daily',[])
+        base=daily_factors(symbol,bars,benchmark,int(p['daily_fast']),int(p['daily_slow']),
+                           p['liquidity_min'],p['relative_strength_min'])
+        if not base.get('data_ready'):return base
+        n=int(p['breakout_days']);maximum=int(p['pullback_days']);tol=p['touch_tolerance_pct']/100
+        if len(bars)<max(n+maximum+1,65):
+            return {**base,'eligible':False,'data_ready':False,'reason':'等待首次回踩所需完整日线'}
+        candidates=[]
+        for j in range(max(n,len(bars)-maximum-1),len(bars)-1):
+            prior=bars[j-n:j];level=max(b.high for b in prior);breaking=bars[j]
+            # Crossing is required: consecutive new highs are not new first
+            # breakouts unless price has reset below that prior platform.
+            if not bars[j-1].close<=level<breaking.close:continue
+            tail=bars[j+1:]
+            if not 1<=len(tail)<=maximum:continue
+            touching=next((i for i,b in enumerate(tail) if b.low<=level*(1+tol)),None)
+            if touching is None:continue
+            touched=tail[touching:]
+            structure_low=min(b.low for b in touched)
+            intact=all(b.close>=level*(1-tol) for b in tail)
+            # Once a complete daily bar already reclaimed the previous high,
+            # that first pullback has ended. A later dip cannot recycle it.
+            recovered=any(touched[i].close>touched[i-1].high for i in range(1,len(touched)))
+            mean=sum(b.volume for b in prior)/len(prior)
+            contraction=sum(b.volume for b in tail)/len(tail)/mean if mean else None
+            target=max(b.high for b in bars[j:])
+            setup=bool(base['eligible'] and intact and not recovered and contraction is not None
+                       and contraction<=p['volume_contraction_max'])
+            candidates.append({**base,'eligible':setup,'level':level,'structural_stop':tick_price(round(structure_low-.01,6)),
+                               'structure_anchor':breaking.start.isoformat(),'pullback_sessions':len(tail),
+                               'volume_contraction':contraction,'prior_high':target,
+                               'reason':'首次缩量回踩结构通过，等待盘中转强' if setup else
+                                        '首次回踩已结束或支撑、趋势、缩量条件未通过'})
+        if candidates:return candidates[0]
+        return {**base,'eligible':False,'reason':'等待日线突破后的首次1至5日缩量回踩'}
+
+    def _rolling_intraday(self,symbol,today,period=20):
+        """Use same-source completed prior-session bars, cutting at any real gap."""
+        if not today:return []
+        market=symbol_market(symbol);day=local_date(today[0].start,market);source=today[0].source
+        previous={b.start:b for d,session in self.context[symbol].get('sessions',{}).items() if d<day
+                  for b in session.values() if b.final and b.valid() and b.source==source and b.end<=today[0].start}
+        previous.update({b.start:b for b in self.history.get(symbol,[]) if b.final and b.valid()
+                         and b.source==source and local_date(b.start,market)<day and b.end<=today[0].start})
+        rows=[previous[t] for t in sorted(previous)[-max(period*3,22):]]+list(today)
+        start=len(rows)-1
+        while start>0 and adjacent(rows[start-1].start,rows[start].start,market):start-=1
+        return rows[start:]
 
     def _trend_rsi_daily(self,symbol,p):
         market=symbol_market(symbol);ctx=self.context[symbol];bars=ctx.get('daily_bars',[]);benchmark=ctx.get('benchmark_daily',[])
         need=max(int(p['daily_slow'])+5,int(p['rsi_period'])+7,25)
-        if len(bars)<need or len(benchmark)<21:return {'eligible':False,'reason':f'等待趋势RSI所需日线（{len(bars)}/{need}）'}
+        if len(bars)<need or len(benchmark)<21:return {'eligible':False,'data_ready':False,'reason':f'等待趋势RSI所需日线（{len(bars)}/{need}）'}
         base=daily_factors(symbol,bars,benchmark,p['daily_fast'],p['daily_slow'],p['liquidity_min'],p['relative_strength_min'])
         closes=[b.close for b in bars];volumes=[b.volume for b in bars];rsi=_rsi_series(closes,int(p['rsi_period']))
         current=rsi[-1];peak=max(x for x in rsi[-6:-1] if x is not None)
@@ -161,7 +229,7 @@ class ResearchEngine:
 
     def _vcp_daily(self,symbol,p):
         market=symbol_market(symbol);ctx=self.context[symbol];bars=ctx.get('daily_bars',[]);benchmark=ctx.get('benchmark_daily',[])
-        if len(bars)<260:return {'eligible':False,'reason':f'VCP需要260根完整日线（{len(bars)}/260）','required_daily':260}
+        if len(bars)<260:return {'eligible':False,'data_ready':False,'reason':f'VCP需要260根完整日线（{len(bars)}/260）','required_daily':260}
         closes=[b.close for b in bars];fast=_ema_series(closes,int(p['ema_fast']));mid=_ema_series(closes,int(p['ema_mid']));slow=_ema_series(closes,int(p['ema_slow']))
         slope=int(p['slow_slope_days']);stacked=fast[-1]>mid[-1]>slow[-1] and closes[-1]>slow[-1] and slow[-1]>slow[-1-slope]
         rs20=_relative_return(bars,benchmark,20,market);rs60=_relative_return(bars,benchmark,60,market)
@@ -176,7 +244,8 @@ class ResearchEngine:
         setup=bool(stacked and rs20 is not None and rs60 is not None and rs20>0 and rs60>0 and rank_ok and higher
                    and atr_ratio is not None and atr_ratio<=p['contraction_max'] and range_ratio is not None
                    and range_ratio<=p['range_contraction_max'] and distance<=p['near_high_pct'] and amount>=threshold)
-        return {'eligible':setup,'trend':stacked,'ema_fast':fast[-1],'ema_mid':mid[-1],'ema_slow':slow[-1],
+        return {'eligible':setup,'data_ready':rs20 is not None and rs60 is not None and percentile is not None,
+                'trend':stacked,'ema_fast':fast[-1],'ema_mid':mid[-1],'ema_slow':slow[-1],
                 'relative_strength':rs20,'relative_strength_60':rs60,'rs_percentile':percentile,'rank_coverage':coverage,
                 'higher_high_low':higher,'atr':long,'atr_contraction':atr_ratio,'range_contraction':range_ratio,
                 'distance_to_high_pct':distance,'average_turnover':amount,
@@ -226,7 +295,9 @@ class ResearchEngine:
                 strategy_views[strategy]={'status':'disabled','ready':False,'reason':'该策略已停用'};continue
             daily=self._daily(symbol,strategy)
             if not daily.get('eligible'):
-                strategy_views[strategy]={**daily,'status':'wait','ready':False};continue
+                baseline=definition['data_requirements']['intraday_baseline_sessions']
+                ready=daily.get('data_ready',False) and (not baseline or len(rvol)==len(today))
+                strategy_views[strategy]={**daily,'status':'wait','ready':ready};continue
             if strategy in ('breakout','pullback'):
                 found,view=self._opening_strategy(symbol,strategy,today,frame,rvol,group,daily)
             elif strategy=='trend_pullback':
@@ -237,14 +308,19 @@ class ResearchEngine:
                 found,view=self._trend_rsi_pullback(symbol,today,frame,group,daily)
             elif strategy=='vcp_swing':
                 found,view=self._vcp_swing(symbol,today,frame,rvol,group,daily)
+            elif strategy=='first_pullback':
+                found,view=self._first_pullback(symbol,today,frame,group,daily)
             else:
                 found,view=self._orb20_us(symbol,today,frame,rvol,group,daily)
             signals.extend(found);strategy_views[strategy]=view
-        aggregate.update(ready=True,last_bar=current.start.isoformat(),strategies=strategy_views)
+        aggregate.update(ready=any(v.get('ready') for v in strategy_views.values()),
+                         all_ready=all(v.get('ready') for v in strategy_views.values() if v.get('status')!='disabled'),
+                         last_bar=current.start.isoformat(),strategies=strategy_views)
         confirmed=[k for k,v in strategy_views.items() if v.get('status')=='signal']
         aggregate['reason']='买点已确认，正在核对现价、盘口和资金' if confirmed else next((v.get('reason') for v in strategy_views.values() if v.get('ready')), '等待策略条件成立')
-        preferred=strategy_views.get('breakout',{})
-        aggregate.update({k:v for k,v in preferred.items() if k!='strategies'});aggregate['strategies']=strategy_views
+        preferred=next((v for v in strategy_views.values() if v.get('status')=='signal'),None) or next((v for v in strategy_views.values() if v.get('ready')), {})
+        aggregate.update({k:v for k,v in preferred.items() if k not in ('strategies','ready','reason','source')})
+        aggregate['strategies']=strategy_views
         return signals
 
     def _opening_strategy(self,symbol,strategy,today,frame,rvol,group,daily):
@@ -276,12 +352,13 @@ class ResearchEngine:
 
     def _trend_pullback(self,symbol,today,frame,group,daily):
         market=symbol_market(symbol);p=self.registry.config('trend_pullback',market);period=p['intraday_ema']
-        if len(today)<period+1:return [],{**daily,'status':'wait','ready':False,'reason':f'等待至少{period+1}根五分钟K线形成EMA'}
-        current=frame[-1];previous=frame[-2];ema_prev=_ema([b.close for b in today[:-1]],period)
+        rolling=self._rolling_intraday(symbol,today,period)
+        if len(today)<2 or len(rolling)<period+1:return [],{**daily,'status':'wait','ready':False,'reason':f'等待同源连续{period+1}根完整五分钟线（可用前一交易日预热）'}
+        current=frame[-1];previous=frame[-2];ema_prev=_ema([b.close for b in rolling[:-1]],period)
         band=max(previous['vwap'] or 0,ema_prev or 0);floor=min(previous['vwap'] or band,ema_prev or band)
         tolerance=p['touch_tolerance_pct']/100
         touched=bool(band and previous['bar'].low<=band*(1+tolerance) and previous['bar'].close>=floor)
-        prior_volumes=[b.volume for b in today[max(0,len(today)-22):-2]]
+        prior_volumes=[b.volume for b in rolling[-22:-2]]
         average=sum(prior_volumes)/len(prior_volumes) if prior_volumes else 0
         ratio=current['bar'].volume/average if average else 0
         market_ok=bool(current['benchmark_vwap'] and current['benchmark'].close>current['benchmark_vwap'])
@@ -294,11 +371,12 @@ class ResearchEngine:
 
     def _trend_rsi_pullback(self,symbol,today,frame,group,daily):
         market=symbol_market(symbol);p=self.registry.config('trend_rsi_pullback',market);period=int(p['intraday_ema'])
-        if len(today)<period+1:return [],{**daily,'status':'wait','ready':False,'reason':f'等待至少{period+1}根五分钟K线形成EMA'}
-        current=frame[-1];previous=frame[-2];ema_prev=_ema([b.close for b in today[:-1]],period)
+        rolling=self._rolling_intraday(symbol,today,period)
+        if len(today)<2 or len(rolling)<period+1:return [],{**daily,'status':'wait','ready':False,'reason':f'等待同源连续{period+1}根完整五分钟线（可用前一交易日预热）'}
+        current=frame[-1];previous=frame[-2];ema_prev=_ema([b.close for b in rolling[:-1]],period)
         band=max(previous['vwap'] or 0,ema_prev or 0);floor=min(previous['vwap'] or band,ema_prev or band)
         touched=bool(band and previous['bar'].low<=band*(1+p['touch_tolerance_pct']/100) and previous['bar'].close>=floor)
-        prior=[b.volume for b in today[max(0,len(today)-22):-2]];average=sum(prior)/len(prior) if prior else 0
+        prior=[b.volume for b in rolling[-22:-2]];average=sum(prior)/len(prior) if prior else 0
         ratio=current['bar'].volume/average if average else 0
         market_ok=bool(current['benchmark_vwap'] and current['benchmark'].close>current['benchmark_vwap'])
         confirmed=touched and current['bar'].close>previous['bar'].high and current['bar'].close>(current['vwap'] or current['bar'].close) and market_ok and ratio>=p['confirm_volume_ratio']
@@ -306,6 +384,31 @@ class ResearchEngine:
         if confirmed and stop<current['bar'].close:
             found=[self._signal(current['bar'],'trend_rsi_pullback',stop,group,daily,{'relative_volume':ratio,'level':band,'vwap':current['vwap'],'benchmark_vwap':current['benchmark_vwap']})]
         return found,{**daily,'status':'signal' if found else 'wait','ready':True,'reason':'买点已确认' if found else '日线回踩通过，等待盘中VWAP或EMA转强','level':band,'stop':stop,'relative_volume':ratio,'vwap':current['vwap'],'benchmark_vwap':current['benchmark_vwap'],'market_ok':market_ok}
+
+    def _first_pullback(self,symbol,today,frame,group,daily):
+        p=self.registry.config('first_pullback','CN');rolling=self._rolling_intraday(symbol,today,20)
+        if len(today)<2 or len(rolling)<21:
+            return [],{**daily,'status':'wait','ready':False,'reason':'等待同源连续20根成交量基线与两根当日完整五分钟线'}
+        current=frame[-1];previous=frame[-2];b=current['bar'];stop=daily['structural_stop']
+        baseline=sum(x.volume for x in rolling[-21:-1])/20
+        ratio=b.volume/baseline if baseline else 0
+        market_ok=bool(current['benchmark_vwap'] and current['benchmark'].close>current['benchmark_vwap'])
+        intact=min(x.low for x in today)>stop
+        reclaim=bool(current['vwap'] and previous['vwap'] and previous['bar'].low<=previous['vwap']
+                     and b.close>current['vwap'] and b.close>previous['bar'].high)
+        timely=b.end<open_time(local_date(b.start,'CN'),'CN')+timedelta(hours=5,minutes=15)
+        confirmed=intact and reclaim and market_ok and ratio>=p['confirm_volume_ratio'] and timely
+        target=min(daily['prior_high'],b.close+2*(b.close-stop))
+        found=[self._signal(b,'first_pullback',stop,group,daily,
+                 {'relative_volume':ratio,'level':daily['level'],'vwap':current['vwap'],
+                  'benchmark_vwap':current['benchmark_vwap'],'target_price':target,
+                  'structure_anchor':daily['structure_anchor']})] if confirmed and stop<b.close<target else []
+        reason=('首次回踩已破坏，撤销计划' if not intact else '已到14:45，今天不再新开计划' if not timely else
+                '前高目标不足，等待新的结构' if confirmed and target<=b.close else
+                '买点已确认' if found else '首次缩量回踩通过，等待收复VWAP、突破前根高点并放量')
+        return found,{**daily,'status':'signal' if found else 'invalid' if not intact else 'wait','ready':True,
+                      'reason':reason,'stop':stop,'target':target,'relative_volume':ratio,'market_ok':market_ok,
+                      'vwap':current['vwap'],'benchmark_vwap':current['benchmark_vwap']}
 
     def _volatility_breakout(self,symbol,today,frame,rvol,group,daily):
         market=symbol_market(symbol);p=self.registry.config('volatility_breakout',market);bars=self.context[symbol].get('daily_bars',[])
@@ -329,6 +432,7 @@ class ResearchEngine:
         market=symbol_market(symbol);p=self.registry.config('vcp_swing',market);bars=self.context[symbol].get('daily_bars',[])
         level=max(b.high for b in bars[-int(p['breakout_days']):]) if bars else None
         final=int(p['final_contraction_days']);stop=min(b.low for b in bars[-final:]) if len(bars)>=final else None
+        if stop is not None and market=='CN':stop=tick_price(round(stop-.01,6))
         if len(rvol)!=len(today):return [],{**daily,'status':'wait','ready':False,'reason':'14日同时间段数据有缺口，继续等待','level':level,'stop':stop}
         current=frame[-1];previous=today[-2] if len(today)>1 else None
         market_ok=bool(current['benchmark_vwap'] and current['benchmark'].close>current['benchmark_vwap'])
@@ -338,7 +442,8 @@ class ResearchEngine:
                        and market_ok and rvol[-1]>=p['rvol_min'] and risk_ok)
         found=[]
         if confirmed:
-            found=[self._signal(current['bar'],'vcp_swing',stop,group,daily,{'relative_volume':rvol[-1],'level':level,'vwap':current['vwap'],'benchmark_vwap':current['benchmark_vwap'],'structural_risk_atr':structural_risk/daily['atr']})]
+            anchor=max(bars[-int(p['breakout_days']):],key=lambda b:b.high).start.isoformat()
+            found=[self._signal(current['bar'],'vcp_swing',stop,group,daily,{'relative_volume':rvol[-1],'level':level,'vwap':current['vwap'],'benchmark_vwap':current['benchmark_vwap'],'structural_risk_atr':structural_risk/daily['atr'],'structure_anchor':anchor})]
         reason='买点已确认' if found else '结构止损超过最大ATR距离，取消本次计划' if structural_risk and daily.get('atr') and not risk_ok else 'VCP条件通过，等待放量突破最终整理平台'
         return found,{**daily,'status':'signal' if found else 'wait','ready':True,'reason':reason,'level':level,'stop':stop,'relative_volume':rvol[-1],'vwap':current['vwap'],'benchmark_vwap':current['benchmark_vwap'],'market_ok':market_ok,'risk_ok':risk_ok}
 

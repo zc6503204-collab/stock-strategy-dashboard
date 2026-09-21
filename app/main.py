@@ -127,14 +127,21 @@ class Settings(BaseModel):
     simulation_enabled:bool=True
     ib_port:int=Field(default=7497,ge=1024,le=65535)
     account_mode:bool=False
+    broker_sync_enabled:bool=False
 
 class ManualHolding(BaseModel):
     id:str|None=Field(default=None,max_length=80)
     symbol:str=Field(max_length=20)
     name:str|None=Field(default=None,max_length=80)
-    quantity:float=Field(gt=0)
-    cost:float=Field(gt=0)
+    quantity:float=Field(gt=0,allow_inf_nan=False)
+    cost:float=Field(gt=0,allow_inf_nan=False)
     entry_date:str|None=Field(default=None,max_length=10)
+    entry_time:str|None=Field(default=None,max_length=40)
+    entry_fee:float=Field(default=0,ge=0,allow_inf_nan=False)
+    plan_id:str|None=Field(default=None,max_length=160)
+    strategy:str|None=Field(default=None,max_length=80)
+    strategy_version:str|None=Field(default=None,max_length=80)
+    original_plan:dict|None=None
     stop:float|None=Field(default=None,gt=0)
     target:float|None=Field(default=None,gt=0)
     note:str=Field(default='',max_length=300)
@@ -148,6 +155,14 @@ class HoldingPlan(BaseModel):
 
 class HoldingId(BaseModel):id:str=Field(max_length=80)
 class HoldingSync(BaseModel):source:str='all'
+class HoldingSell(BaseModel):
+    id:str=Field(max_length=80)
+    quantity:float=Field(gt=0,allow_inf_nan=False)
+    price:float=Field(gt=0,allow_inf_nan=False)
+    sold_at:str=Field(min_length=1,max_length=40)
+    fee:float=Field(default=0,ge=0,allow_inf_nan=False)
+    execution_id:str|None=Field(default=None,max_length=160)
+    note:str=Field(default='',max_length=300)
 
 @app.post('/api/watch')
 async def watch(body:Watch):
@@ -286,6 +301,8 @@ async def scan():
 
 @app.post('/api/settings')
 async def settings(body:Settings):
+    if body.broker_sync_enabled and not dashboard.settings.get('broker_sync_enabled',False):
+        raise HTTPException(400,'请通过明确的券商持仓同步操作开启账户读取')
     if body.monitor_limit<len(dashboard.tracked()):raise HTTPException(400,'请先减少监测股票，再降低名额')
     if not body.simulation_enabled:
         for s in dashboard.tracked():dashboard.sim.cancel_pending(s,'已暂停模拟新开仓')
@@ -294,12 +311,20 @@ async def settings(body:Settings):
 
 @app.post('/api/real-holdings/manual')
 async def real_holding_manual(body:ManualHolding):
-    dashboard.settings['account_mode']=True
-    dashboard.store.set('settings',dashboard.settings)
-    try:row=dashboard.real.upsert_manual(body.model_dump())
+    try:row=dashboard.real.upsert_manual(body.model_dump(exclude_unset=True))
     except ValueError as e:raise HTTPException(400,str(e))
     dashboard.candidate(row['symbol'])['name']=row['name'];dashboard.first_poll=True
-    dashboard.evaluate_decisions();dashboard.broadcast();return {'ok':True,'id':row['id']}
+    dashboard.evaluate_decisions();dashboard.broadcast();return {'ok':True,'id':row['id'],'row':row}
+
+@app.get('/api/real-holdings/history')
+async def real_holding_history():
+    return {'rows':[r for r in dashboard.real.list() if r.get('source')=='manual']}
+
+@app.post('/api/real-holdings/sell')
+async def real_holding_sell(body:HoldingSell):
+    try:row=dashboard.real.record_manual_sell(body.id,body.quantity,body.price,body.sold_at,body.fee,body.execution_id,body.note)
+    except ValueError as e:raise HTTPException(400,str(e))
+    dashboard.evaluate_decisions();dashboard.broadcast();return {'ok':True,'id':row['id'],'row':row}
 
 @app.post('/api/real-holdings/plan')
 async def real_holding_plan(body:HoldingPlan):
@@ -317,6 +342,7 @@ async def real_holding_remove(body:HoldingId):
 async def real_holding_sync(body:HoldingSync):
     if body.source not in ['all','longbridge','ibkr']:raise HTTPException(400,'未知持仓来源')
     dashboard.settings['account_mode']=True
+    dashboard.settings['broker_sync_enabled']=True
     dashboard.store.set('settings',dashboard.settings)
     sources=['longbridge','ibkr'] if body.source=='all' else [body.source]
     await dashboard.sync_real_holdings(sources)
@@ -404,3 +430,34 @@ async def research_candidate(symbol:str,limit:int=100):
 @app.get('/api/research/comparison')
 async def research_comparison(market:str='CN'):
     return dashboard.autoresearch.comparison(research_market(market))
+
+
+class ConfirmPlanBuy(BaseModel):
+    quantity:float=Field(gt=0)
+    cost:float=Field(gt=0)
+    entry_time:str|None=Field(default=None,max_length=50)
+    entry_date:str|None=Field(default=None,max_length=10)
+    entry_fee:float=Field(default=0,ge=0)
+    note:str=Field(default='',max_length=300)
+
+
+@app.get('/api/plans')
+async def plans(market:str='CN',history:bool=False):
+    return {'plans':dashboard.plans.list(research_market(market),history)}
+
+
+@app.get('/api/plans/{plan_id}')
+async def plan_detail(plan_id:str):
+    row=dashboard.plans.rows.get(plan_id)
+    if not row:raise HTTPException(404,'计划不存在')
+    return {'plan':row,'history':[r for r in dashboard.store.research_list('plan_history',row['market'],symbol=row['symbol'],limit=100) if r['id']==plan_id]}
+
+
+@app.post('/api/plans/{plan_id}/confirm-buy')
+async def confirm_plan_buy(plan_id:str,body:ConfirmPlanBuy):
+    from .models import now
+    try:row=dashboard.plans.confirm_buy(plan_id,body.model_dump(exclude_none=True),dashboard.real,now())
+    except ValueError as e:raise HTTPException(400,str(e))
+    dashboard.candidate(row['symbol'])['name']=row['name'];dashboard.first_poll=True
+    dashboard.allocate_monitoring();dashboard.evaluate_decisions();dashboard.broadcast()
+    return {'ok':True,'holding':row}

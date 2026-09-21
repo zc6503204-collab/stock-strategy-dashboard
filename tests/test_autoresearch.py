@@ -3,7 +3,7 @@ from datetime import timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from app.autoresearch import AutoResearch, complete_daily, daily_cutoff, rotate_monitoring
+from app.autoresearch import AutoResearch, complete_daily, daily_cutoff, rotate_monitoring, IMPLEMENTATION
 from app.models import Bar, Quote, stamp
 from app.calendars import calendar, local_date
 from app.service import Dashboard
@@ -183,12 +183,15 @@ def test_report_no_trades_explains_missing_data_and_notifications_not_replayed(t
     assert not report['scan_complete'] and not d.alerts.list()
 
 
-def test_independent_mode_never_uses_saved_real_holdings(tmp_path):
+def test_manual_confirmation_tracks_local_holding_without_enabling_broker_context(tmp_path):
     d=Dashboard(tmp_path)
     d.real.upsert_manual({'symbol':'600001.SH','quantity':100,'cost':10})
-    assert not d.research_real_holdings() and not d.protected_monitoring()
-    d.settings['account_mode']=True
+    d.real.rows.append({'symbol':'600002.SH','source':'longbridge','quantity':100,'cost':10})
+    assert [r['symbol'] for r in d.research_real_holdings()]==['600001.SH']
     assert d.protected_monitoring()==['600001.SH']
+    assert not d.settings.get('account_mode',False)
+    d.settings['account_mode']=True
+    assert d.protected_monitoring()==['600001.SH','600002.SH']
 
 
 def test_new_day_old_candidates_cannot_reenter_on_quote_alone(tmp_path,monkeypatch):
@@ -203,7 +206,7 @@ def test_new_day_old_candidates_cannot_reenter_on_quote_alone(tmp_path,monkeypat
     d.lb.quotes=quotes
     asyncio.run(d.autoresearch.refresh_pool())
     assert d.selection[0]['data_quality']=='missing' and not d.research_entry_allowed('600001.SH')
-    d.selection[0].update(checked_session='2026-09-22',data_quality='complete')
+    d.selection[0].update(checked_session='2026-09-22',data_quality='complete',setup_ready=True,setup_checked_at=t.isoformat())
     assert d.research_entry_allowed('600001.SH')
 
 
@@ -220,10 +223,13 @@ def test_runtime_requires_actual_full_days_and_detects_sleep(tmp_path):
     for day in ['2026-09-21','2026-09-22']:
         base=stamp(day+'T01:10Z')
         for i in range(361):d.autoresearch.record_runtime(base+timedelta(minutes=i))
-        d.store.research_save('run',day,{'date':day,'universe_complete':True,'checked':100,'ended_at':day+'T07:10Z'})
-        for kind in ['premarket','close']:d.store.research_save('report',day+kind,{'date':day,'kind':kind})
+        d.store.research_save('run',day,{'date':day,'implementation':IMPLEMENTATION,'universe_complete':True,'checked':100,'ended_at':day+'T07:10Z'})
+        d.store.research_save('discovery',day,{'date':day,'implementation':IMPLEMENTATION,'universe_complete':True,'supported':100,'quote_checked':100,'quote_missing':0,'ended_at':day+'T07:00Z'})
+        for kind in ['premarket','close']:d.store.research_save('report',day+kind,{'date':day,'kind':kind,'implementation':IMPLEMENTATION})
     assert d.autoresearch.runtime_validation()['state']=='verified'
     assert len(d.autoresearch.runtime_validation()['verified_days'])==2
+    assert d.autoresearch.runtime_validation()['operational_two_days']
+    assert d.autoresearch.runtime_validation()['full_coverage']['state']=='incomplete'
     other=Dashboard(tmp_path/'gap')
     for at in ['01:10','01:31','02:00','07:10']:
         other.autoresearch.record_runtime(stamp('2026-09-21T'+at+'Z'))
@@ -248,3 +254,36 @@ def test_research_read_apis_do_not_schedule_or_read_accounts(tmp_path,monkeypatc
         assert result['strategies'] and all(r['signal_to_fill_rate'] is None for r in result['strategies'])
         assert c.get('/api/research/days?market=BAD').status_code==400
         assert c.get('/api/research/candidates/invalid').status_code==400
+
+
+def test_comparison_counts_structures_not_repeat_confirmations(tmp_path):
+    from app.models import Signal
+    d=Dashboard(tmp_path);strategy='trend_pullback';version=d.registry.current(strategy,'CN')['version']
+    d.strategy_performance_detail=lambda market,strategy,version=None:{'version':version or d.registry.current(strategy,market)['version']}
+    for i in range(3):
+        signal=Signal(str(i),'600001.SH',strategy,'longbridge',stamp('2026-09-21T02:00Z')+timedelta(minutes=5*i),10,9,'normal',{'structure_id':'same'},version)
+        d.store.signal(signal)
+    d.sim.state['accounts']['CN']['trades']=[{'id':'0','strategy':strategy,'version':version,'evidence':{'structure_id':'same'}}]
+    row=next(r for r in d.autoresearch.comparison()['strategies'] if r['strategy']==strategy)
+    assert row['raw_signal_count']==3 and row['signal_count']==1 and row['filled_count']==1
+    assert row['signal_to_fill_rate']==1 and row['correlated_sample']['reconfirmations']==2
+
+
+def test_interrupted_history_resumes_after_twenty_without_starting_quote_discovery(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);t=stamp('2026-09-21T12:30Z');calls=[]
+    monkeypatch.setattr('app.autoresearch.now',lambda:t)
+    d.autoresearch.status={'state':'interrupted','checked':10,'supported':100}
+    d.autoresearch.request=lambda force=False:calls.append(force)
+    asyncio.run(d.autoresearch.tick(t))
+    assert calls==[False] and d.autoresearch.pool_task is None
+
+
+def test_runtime_completion_local_notification_only_once(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);t=stamp('2026-09-21T12:30Z')
+    monkeypatch.setattr('app.autoresearch.now',lambda:t)
+    d.autoresearch.runtime_validation=lambda:{'operational_two_days':True,'full_coverage':{'state':'incomplete'}}
+    async def run():
+        await d.autoresearch.tick(t);await d.autoresearch.tick(t+timedelta(minutes=1))
+    asyncio.run(run())
+    alerts=[a for a in d.alerts.list() if a['id'].startswith('runtime_verified_notification:')]
+    assert len(alerts)==1 and d.store.get('runtime_verified_notification:'+IMPLEMENTATION)

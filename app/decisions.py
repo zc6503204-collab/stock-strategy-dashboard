@@ -6,6 +6,7 @@ from .models import Signal,stamp,symbol_market
 from .calendars import is_open,local_date,calendar,close_time,session_count
 from .risk import size_entry
 from .research import VERSION
+from .plan_rules import execution_range
 
 def fresh_quote(q,t,source=None):
     return bool(q and q.market_time and q.quality=='realtime' and (not source or q.source==source)
@@ -30,26 +31,39 @@ def check(signal,q,validation,account,cfg,t,active_versions=None):
     def reject(reason,state='wait'):
         return {**base,'state':state,'action':'暂不买入' if state=='avoid' else '继续等待','reason':reason}
     m=symbol_market(signal.symbol)
+    if m=='CN':
+        prices=execution_range(signal,cfg)
+        base.update({key:prices.get(key) for key in ('entry_min','entry_max','stop','target','net_rr','price_tick','quote_max','costs')})
+        base.update(structure_id=signal.evidence.get('structure_id'),entry_deadline=signal.evidence.get('entry_deadline'))
     expected=(active_versions or {}).get((m,signal.strategy),VERSION)
     if signal.version!=expected:return reject('旧版历史信号，不作为当前买入建议','avoid')
     if not signal.time<=t<signal.time+timedelta(minutes=valid_minutes):return reject('买点已过期，等待新信号','avoid')
+    if signal.evidence.get('entry_deadline') and t>=stamp(signal.evidence['entry_deadline']):return reject('已到计划最晚入场时间，今天不再买入','avoid')
     if not is_open(t,m):return reject('当前不是正常交易时段')
     if validation.get('research_eligible') is False:return reject('本轮研究资格失效或数据待恢复')
     if not validation.get('ready') or not validation.get('eligible') or validation.get('source')!=signal.source:
         return reject('行情数据或交易范围尚未通过核验')
+    chain=validation.get('research_chain')
+    if m=='CN' and chain is not None and not chain.get('passed'):
+        return reject(chain.get('reason') or '市场、板块或重大事件条件尚未全部核验')
     if not fresh_quote(q,t,signal.source):return reject('等待已验证的同源新报价')
     base.update(current_price=q.price,quote_time=q.market_time.isoformat(),depth_time=q.depth_time.isoformat() if q.depth_time else None)
     if q.trade_status!='Normal':return reject('停牌或交易状态尚未确认','avoid')
     if not book_ok(q,t):return reject('等待15秒内有效买卖盘')
+    if m=='CN':
+        prices=execution_range(signal,cfg,q)
+        base.update({key:prices.get(key) for key in ('entry_min','entry_max','stop','target','net_rr','price_tick','quote_max','costs')})
+        if not prices['executable']:return reject(prices['reason'],'avoid' if q.price>=signal.trigger else 'wait')
     if q.price<signal.trigger or q.ask<signal.trigger:return reject('价格回到触发价以下，等待重新确认')
-    if q.price>base['entry_max'] or q.ask>base['entry_max']:return reject('已超过不追价上限','avoid')
+    if m!='CN' and (q.price>base['entry_max'] or q.ask>base['entry_max']):return reject('已超过不追价上限','avoid')
     if q.limit_up and (q.price>=q.limit_up or q.ask>=q.limit_up):return reject('触及涨停，不能确认可买入','avoid')
     slip=cfg['high_risk_slippage'] if signal.risk_group!='normal' else cfg['slippage']
-    price=q.ask*(1+slip)
+    price=prices['estimated_fill'] if m=='CN' else q.ask*(1+slip)
     if price>base['entry_max']:return reject('计入滑点后超过不追价上限','avoid')
     liquidity=min(float(signal.evidence.get('bar',{}).get('volume',0))*cfg['participation'],q.ask_size)
     sizing=size_entry(signal,price,account,cfg,liquidity)
     if not sizing['ok']:return reject(sizing['reason'])
+    if m=='CN':sizing['target']=prices['target']
     return {**base,**sizing,'state':'buy','action':'可考虑买入','reason':'趋势、放量、盘中确认、现价、盘口和资金均通过',
             'earliest_sell':earliest_sell(t,m)}
 
@@ -60,7 +74,7 @@ def earliest_sell(t,market):
     except Exception:return '交易日历待更新'
 
 def rank_key(r):
-    return (-r.get('forward_quality',0),-r.get('relative_volume',0),-r.get('relative_strength',0),r.get('cost_ratio',999),r['symbol'],r['strategy'])
+    return (-r.get('relative_volume',0),-r.get('relative_strength',0),r.get('cost_ratio',999),r['symbol'],r['strategy'])
 
 
 def shadow_recommend(signals,quotes,validation,simulation,t,active_versions=None):

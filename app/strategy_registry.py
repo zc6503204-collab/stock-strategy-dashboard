@@ -6,6 +6,7 @@ from hashlib import sha256
 
 from .models import now
 
+CN_EXECUTION_REVISION = 'dynamic-plans-1'
 
 DEFINITIONS = {
     'breakout': {
@@ -51,6 +52,7 @@ DEFINITIONS = {
         'exit_policy': {'type': 'risk_partial', 'target_r': 2, 'trail': 'intraday_3bar'},
         'data_requirements': {'daily_bars': 65, 'intraday_baseline_sessions': 0},
         'research_reference': '本地实验规则；日线趋势与盘中VWAP/EMA回踩',
+        'engine_revision': '2.0.0',
         'parameters': {
             'daily_fast': ('日线快速均线', 'int', 5, 60, 20),
             'daily_slow': ('日线慢速均线', 'int', 20, 120, 60),
@@ -93,6 +95,7 @@ DEFINITIONS = {
         'exit_policy': {'type': 'risk_partial', 'target_r': 2, 'trail': 'intraday_3bar'},
         'data_requirements': {'daily_bars': 65, 'intraday_baseline_sessions': 0},
         'research_reference': 'tick-stock-panel RSI中轴与MA20回踩思路的本地重构',
+        'engine_revision': '2.0.0',
         'parameters': {
             'daily_fast': ('日线快速均线', 'int', 10, 40, 20),
             'daily_slow': ('日线慢速均线', 'int', 40, 120, 60),
@@ -119,6 +122,7 @@ DEFINITIONS = {
         'exit_policy': {'type': 'risk_partial', 'target_r': 2, 'trail': 'daily_3low'},
         'data_requirements': {'daily_bars': 260, 'intraday_baseline_sessions': 14},
         'research_reference': 'Qullamaggie breakout scanner质量因子与VCP框架的本地重构',
+        'engine_revision': '2.0.0',
         'parameters': {
             'ema_fast': ('快速EMA', 'int', 5, 30, 10),
             'ema_mid': ('中速EMA', 'int', 10, 50, 20),
@@ -136,6 +140,27 @@ DEFINITIONS = {
             'max_stop_atr': ('最大结构止损ATR倍数', 'float', 1., 6., 3.),
             'signal_minutes': ('信号有效分钟', 'int', 1, 30, 5),
             'liquidity_min': ('20日平均成交额', 'float', 100000., 1e10, {'CN': 1e8, 'US': 5e6}),
+        },
+    },
+    'first_pullback': {
+        'name': '强势首次缩量回踩',
+        'summary': '日线突破后的首次1至5日缩量回踩，守住结构后等待五分钟转强。',
+        'category': '趋势回调', 'markets': ['CN'], 'horizon': 'short', 'max_hold_sessions': 3,
+        'exit_policy': {'type': 'risk_partial', 'target_r': 2, 'trail': 'intraday_3bar'},
+        'data_requirements': {'daily_bars': 65, 'intraday_baseline_sessions': 0},
+        'research_reference': 'S04强势回踩规则卡；本地确定性实验，尚无已验证高胜率',
+        'engine_revision': '1.0.0',
+        'parameters': {
+            'daily_fast': ('日线快速均线', 'int', 10, 40, 20),
+            'daily_slow': ('日线慢速均线', 'int', 40, 120, 60),
+            'breakout_days': ('突破平台观察天数', 'int', 10, 60, 20),
+            'pullback_days': ('首次回踩最长天数', 'int', 1, 5, 5),
+            'touch_tolerance_pct': ('回踩支撑容差百分比', 'float', 0., 3., .3),
+            'volume_contraction_max': ('回踩量与突破前均量上限', 'float', .2, 1., .8),
+            'confirm_volume_ratio': ('五分钟确认量比', 'float', .5, 5., 1.2),
+            'signal_minutes': ('信号有效分钟', 'int', 1, 30, 5),
+            'liquidity_min': ('20日平均成交额', 'float', 100000., 1e10, 1e8),
+            'relative_strength_min': ('20日相对强弱下限', 'float', -20., 50., 0.),
         },
     },
     'orb20_us': {
@@ -184,19 +209,38 @@ class StrategyRegistry:
                     continue
                 self.revisions[market].setdefault(strategy, [])
                 if not self.revisions[market][strategy]:
-                    version = '实验 2.0.0' if strategy in ('breakout', 'pullback') else f'{strategy} 1.0.0'
+                    revision=definition.get('engine_revision','1.0.0')
+                    version = '实验 2.0.0' if strategy in ('breakout', 'pullback') else f'{strategy} {revision}'
+                    if market=='CN':version+=f' · {CN_EXECUTION_REVISION}'
                     row = {
                         'strategy': strategy, 'market': market, 'version': version,
                         'enabled': True, 'parameters': self.defaults(strategy, market),
                         'created_at': now().isoformat(), 'parent_version': None,
                         'changes': {}, 'reason': '系统默认参数',
-                        'validation_status': '前向样本积累中', 'replay': None,
+                        'validation_status': '前向样本积累中', 'replay': None, 'engine_revision':revision,
                     }
+                    if market=='CN':row['execution_revision']=CN_EXECUTION_REVISION
                     self.revisions[market][strategy].append(row)
                     self.active[market][strategy] = version
                     changed = True
                 elif strategy not in self.active[market]:
                     self.active[market][strategy] = self.revisions[market][strategy][-1]['version'];changed = True
+                revision=definition.get('engine_revision')
+                if revision or market=='CN':
+                    old=self.current(strategy,market)
+                    engine_changed=bool(revision and old.get('engine_revision')!=revision)
+                    execution_changed=market=='CN' and old.get('execution_revision')!=CN_EXECUTION_REVISION
+                    if engine_changed or execution_changed:
+                        version=f'{strategy}-{market}-rules-{revision or "1.0.0"}-{len(self.revisions[market][strategy])+1}'
+                        changes={}
+                        if engine_changed:changes['engine_revision']={'from':old.get('engine_revision','1.0.0'),'to':revision}
+                        if execution_changed:changes['execution_revision']={'from':old.get('execution_revision','legacy'),'to':CN_EXECUTION_REVISION}
+                        row={**old,'version':version,'engine_revision':revision or old.get('engine_revision','1.0.0'),'parent_version':old['version'],
+                             'created_at':now().isoformat(),'replay':None,'validation_status':'规则修订，前向样本重新积累',
+                             'changes':changes,
+                             'reason':'完整历史预热与结构计划、成本后收益风险比及研究链规则修订；保留旧版本成绩'}
+                        if market=='CN':row['execution_revision']=CN_EXECUTION_REVISION
+                        self.revisions[market][strategy].append(row);self.active[market][strategy]=version;changed=True
         if changed:self._save()
 
     def _save(self):
@@ -238,7 +282,7 @@ class StrategyRegistry:
             except (TypeError, ValueError):raise ValueError(f'{label}必须是数字')
             if not low <= value <= high:raise ValueError(f'{label}需在{low:g}至{high:g}之间')
             values[key] = value
-        if strategy in ('trend_pullback','trend_rsi_pullback') and values['daily_slow'] <= values['daily_fast']:
+        if strategy in ('trend_pullback','trend_rsi_pullback','first_pullback') and values['daily_slow'] <= values['daily_fast']:
             raise ValueError('日线慢速均线必须大于快速均线')
         if strategy in ('volatility_breakout','vcp_swing') and values['atr_long'] <= values['atr_short']:
             raise ValueError('长ATR周期必须大于短ATR周期')
@@ -265,7 +309,9 @@ class StrategyRegistry:
         row = {'strategy': strategy, 'market': market, 'version': version, 'enabled': enabled,
                'parameters': values, 'created_at': now().isoformat(), 'parent_version': old['version'],
                'changes': changes, 'reason': str(reason or '用户修改参数')[:200],
-               'validation_status': '前向样本重新积累', 'replay': None}
+               'validation_status': '前向样本重新积累', 'replay': None,
+               'engine_revision':old.get('engine_revision',DEFINITIONS[strategy].get('engine_revision','1.0.0'))}
+        if market=='CN':row['execution_revision']=old.get('execution_revision',CN_EXECUTION_REVISION)
         self.revisions[market][strategy].append(row);self.active[market][strategy] = version;self._save();return deepcopy(row)
 
     def rollback(self, strategy, market, version):

@@ -92,3 +92,74 @@ def test_failed_broker_refresh_keeps_last_good_snapshot(tmp_path):
     asyncio.run(d.sync_real_holdings(['longbridge']))
     assert d.real.list()[0]['symbol']=='AAPL.US'
     assert d.holding_sync['longbridge']['state']=='waiting'
+
+
+def test_manual_partial_sell_costs_remaining_and_closed_history(tmp_path):
+    store=Store(tmp_path/'holdings.db');book=RealHoldings(store)
+    original={'entry_min':10,'entry_max':10.25,'stop':9,'target':12,'max_hold_sessions':3}
+    row=book.upsert_manual({'symbol':'600001.SH','quantity':400,'cost':10.5,'entry_time':'2026-09-08T10:00:00+08:00',
+        'entry_fee':8,'stop':9,'target':12,'plan_id':'plan:1','strategy':'strong_pullback','strategy_version':'trial-1','original_plan':original})
+    original['stop']=1
+    assert row['original_plan']['stop']==9
+    assert row['entry_date']=='2026-09-08' and row['plan_deviations']==['实际买价高于原计划禁止追价上限']
+    result=book.record_manual_sell(row['id'],100,12,'2026-09-09T10:00:00+08:00',3,'fill:1')
+    assert result['quantity']==300 and result['realized_pnl']==145
+    assert result['sell_fills'][0]['entry_fee_allocated']==2
+    restarted=RealHoldings(store)
+    again=restarted.record_manual_sell(row['id'],100,12,'2026-09-09T10:00:00+08:00',3,'fill:1')
+    assert again['quantity']==300 and len(again['sell_fills'])==1
+    with pytest.raises(ValueError,match='成交编号'):
+        restarted.record_manual_sell(row['id'],200,12,'2026-09-09T10:00:00+08:00',3,'fill:1')
+    closed=restarted.record_manual_sell(row['id'],300,11,'2026-09-10T10:00:00+08:00',5,'fill:2')
+    assert closed['status']=='closed' and closed['quantity']==0 and closed['realized_pnl']==284
+    assert closed['entry_fee_allocated']==8 and restarted.symbols()==[]
+    assert RealHoldings(store).list()[0]['sell_fills']==closed['sell_fills']
+    with pytest.raises(ValueError,match='保留成交账本'):restarted.remove_manual(row['id'])
+
+
+def test_manual_sell_checks_t1_over_sell_dates_and_finite_numbers(tmp_path):
+    book=RealHoldings(Store(tmp_path/'holdings.db'))
+    row=book.upsert_manual({'symbol':'600001.SH','quantity':200,'cost':10,'entry_date':'2026-09-08','stop':9})
+    for qty,price,time,fee,reason in [
+        (100,11,'2026-09-08T14:00:00+08:00',0,r'T\+1'),
+        (201,11,'2026-09-09T14:00:00+08:00',0,'超过'),
+        (100,11,'2026-09-12T14:00:00+08:00',0,'交易日'),
+        (100,float('nan'),'2026-09-09T14:00:00+08:00',0,'大于0'),
+        (100,11,'2026-09-09T14:00:00+08:00',-1,'费用'),
+    ]:
+        with pytest.raises(ValueError,match=reason):book.record_manual_sell(row['id'],qty,price,time,fee)
+    assert book.list()[0]['quantity']==200 and not book.list()[0]['sell_fills']
+    for value in (float('nan'),float('inf')):
+        with pytest.raises(ValueError):book.upsert_manual({'symbol':'AAPL.US','quantity':1,'cost':value})
+    with pytest.raises(ValueError):book.upsert_manual({'symbol':'bad','quantity':1,'cost':1})
+
+
+def test_manual_plan_identity_and_fills_cannot_be_rewritten(tmp_path):
+    book=RealHoldings(Store(tmp_path/'holdings.db'))
+    row=book.upsert_manual({'symbol':'600001.SH','quantity':200,'cost':10,'entry_date':'2026-09-08','stop':9,
+        'plan_id':'original','strategy_version':'v1','original_plan':{'stop':9,'target':12},'entry_fee':5})
+    edited=book.upsert_manual({**row,'stop':10.2,'plan_id':'replacement','original_plan':{'stop':8}})
+    assert edited['plan_id']=='original' and edited['original_plan']=={'stop':9,'target':12}
+    sold=book.record_manual_sell(row['id'],100,12,'2026-09-09T10:00:00+08:00')
+    with pytest.raises(ValueError,match='不能改写'):book.upsert_manual({**sold,'quantity':200})
+    with pytest.raises(ValueError,match='不能改写'):book.set_plan(row['id'],10,12,'2026-09-07')
+    book.set_plan(row['id'],10.5,13,'2026-09-08')
+    assert book.list()[0]['original_plan']['stop']==9
+    returned=book.list();returned[0]['original_plan']['stop']=1
+    assert book.list()[0]['original_plan']['stop']==9
+
+
+def test_legacy_manual_lots_keep_local_t1_and_time_exit(tmp_path):
+    store=Store(tmp_path/'holdings.db')
+    old={'id':'manual:legacy','symbol':'600001.SH','name':'样本','source':'manual','quantity':200,
+         'available':None,'cost':10,'entry_date':'2026-09-08','stop':9,'target':12,
+         'original_plan':{'max_hold_sessions':3}}
+    store.set('real_holdings',[old]);book=RealHoldings(store)
+    t=stamp('2026-09-10T06:50:00Z')
+    q=Quote('600001.SH','longbridge','样本',10,t,t,quality='realtime',session='regular',depth_time=t,
+            bid=9.99,ask=10.01,bid_size=1000,ask_size=1000,trade_status='Normal')
+    plan=real_holding_plan(book.list()[0],q,t,{'ready':True})
+    assert plan['event']=='time_exit' and plan['available']==200 and plan['qty']==200
+    q.limit_down=9.99
+    blocked=real_holding_plan(book.list()[0],q,t,{'ready':True})
+    assert blocked['blocked'] and '跌停' in blocked['reason']

@@ -90,7 +90,7 @@ def test_opening_range_and_rvol_both_markets():
   engine,symbol,bars,benchmark=research_fixture(market)
   for b in bars[:-1]:assert not engine.update(b)
   signals=engine.update(bars[-1]);assert len(signals)==1
-  s=signals[0];assert s.version==VERSION and s.strategy=='breakout' and s.evidence['relative_volume']>=1.5
+  s=signals[0];assert s.version==engine.registry.current(s.strategy,market)['version'] and s.strategy=='breakout' and s.evidence['relative_volume']>=1.5
   assert s.time==open_time(local_date(bars[0].start,market),market)+timedelta(minutes=20 if market=='CN' else 10)
   assert not engine.update(bars[-1])
 

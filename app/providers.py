@@ -127,7 +127,7 @@ class Longbridge(Provider):
         super().__init__();self.ctx=None;self.auth_url=None;self.auth_running=False
         self.loop=None;self.on_quote=None;self.on_bar=None;self.subscribed=set();self.auth_thread=None
         self.units={};self.exchanges={};self.quote_meta={};self.last_push_dispatch={}
-        self.history_lock=asyncio.Lock();self.background_lock=asyncio.Lock();self.cli_lock=asyncio.Lock()
+        self.history_lock=asyncio.Lock();self.research_history_lock=asyncio.Lock();self.background_lock=asyncio.Lock();self.cli_lock=asyncio.Lock()
         self.depth_subscribed=set();self.on_depth=None;self.last_depth_dispatch={};self.io_metrics={};self.next_cli=0.
         self.status.update(state='auth_required',message='SDK持续行情需要授权；可先读取现有CLI数据')
 
@@ -241,9 +241,16 @@ class Longbridge(Provider):
             self.quote_meta[r.symbol]={'previous_close':prev,'trade_status':status}
             result.append(Quote(r.symbol,'longbridge',r.symbol,price,sdk_stamp(r.timestamp),now(),
               change_pct=(price/prev-1)*100 if prev and prev>0 else None,
+              volume=number(getattr(r,'volume',None)),turnover=number(getattr(r,'turnover',None)),
               quality='realtime' if self.realtime_entitled(r.symbol) else 'subscription_unverified',trade_status=status,
               session='regular' if is_open(now(),symbol_market(r.symbol)) else 'closed'))
         return result
+
+    async def filings(self,symbol):
+        """Public disclosure directory only; never accesses a trading account."""
+        rows=await self.background_command('longbridge','filing',symbol,'--count','100','--format','json',timeout=20)
+        if not isinstance(rows,list):raise ValueError('公告目录返回格式不完整')
+        return rows
 
     async def depth(self,symbol):
         if not self.ctx:return None
@@ -266,8 +273,8 @@ class Longbridge(Provider):
             result.append(Bar(symbol,'longbridge',sdk_stamp(r.timestamp),o,h,l,c,v,float(r.turnover)))
         return result
 
-    async def bars(self,symbol,period='5m',count=250,force_cli=False):
-        async with self.history_lock:
+    async def bars(self,symbol,period='5m',count=250,force_cli=False,background=False):
+        async with (self.research_history_lock if background else self.history_lock):
             if self.ctx and not force_cli:
                 from longbridge.openapi import Period,AdjustType
                 rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.candlesticks,symbol,Period.Day if period=='day' else Period.Min_5,count,AdjustType.NoAdjust),20)
