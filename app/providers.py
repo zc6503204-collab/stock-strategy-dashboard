@@ -127,7 +127,8 @@ class Longbridge(Provider):
         super().__init__();self.ctx=None;self.auth_url=None;self.auth_running=False
         self.loop=None;self.on_quote=None;self.on_bar=None;self.subscribed=set();self.auth_thread=None
         self.units={};self.exchanges={};self.quote_meta={};self.last_push_dispatch={}
-        self.history_lock=asyncio.Lock();self.research_history_lock=asyncio.Lock();self.background_lock=asyncio.Lock();self.cli_lock=asyncio.Lock()
+        self.history_lock=asyncio.Lock();self.research_history_lock=asyncio.Lock();self.live_history_lock=asyncio.Lock()
+        self.depth_lock=asyncio.Lock();self.background_lock=asyncio.Lock();self.cli_lock=asyncio.Lock()
         self.depth_subscribed=set();self.on_depth=None;self.last_depth_dispatch={};self.io_metrics={};self.next_cli=0.
         self.status.update(state='auth_required',message='SDK持续行情需要授权；可先读取现有CLI数据')
 
@@ -254,7 +255,7 @@ class Longbridge(Provider):
 
     async def depth(self,symbol):
         if not self.ctx:return None
-        async with self.lock:r=await asyncio.wait_for(asyncio.to_thread(self.ctx.depth,symbol),8)
+        async with self.depth_lock:r=await asyncio.wait_for(asyncio.to_thread(self.ctx.depth,symbol),8)
         bid=next((x for x in r.bids if number(x.price,0)>0),None)
         ask=next((x for x in r.asks if number(x.price,0)>0),None)
         if not bid or not ask:return None
@@ -273,8 +274,10 @@ class Longbridge(Provider):
             result.append(Bar(symbol,'longbridge',sdk_stamp(r.timestamp),o,h,l,c,v,float(r.turnover)))
         return result
 
-    async def bars(self,symbol,period='5m',count=250,force_cli=False,background=False):
-        async with (self.research_history_lock if background else self.history_lock):
+    async def bars(self,symbol,period='5m',count=250,force_cli=False,background=False,live=False):
+        # Live benchmark recovery must not queue behind the whole-universe
+        # daily warm-up or independent candidate research.
+        async with (self.live_history_lock if live else self.research_history_lock if background else self.history_lock):
             if self.ctx and not force_cli:
                 from longbridge.openapi import Period,AdjustType
                 rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.candlesticks,symbol,Period.Day if period=='day' else Period.Min_5,count,AdjustType.NoAdjust),20)

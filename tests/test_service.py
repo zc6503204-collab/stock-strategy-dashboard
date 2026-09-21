@@ -47,9 +47,62 @@ def test_lunch_reconnect_refreshes_intraday_benchmark(tmp_path,monkeypatch):
         return [Bar(symbol,'longbridge',stamp('2026-09-10T03:25:00Z'),100,101,99,100,1000,100000)]
     d.lb.quotes=quotes;d.lb.bars=bars
     d.strategies.set_benchmark=lambda market,rows:received.append((market,rows))
-    asyncio.run(d.refresh_live())
+    async def refresh():
+        await d.refresh_live();await d.live_benchmark_task;await d.live_books_task
+    asyncio.run(refresh())
     assert requested==['000300.SH']
     assert received and received[0][0]=='CN' and received[0][1][0].symbol=='000300.SH'
+
+def test_live_quotes_continue_while_book_and_benchmark_requests_wait(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);t=stamp('2026-09-21T02:00:10Z')
+    monkeypatch.setattr('app.service.now',lambda:t)
+    d.lb.ctx=object();d.watch=['600001.SH'];d.research_real_symbols=lambda:['600001.SH']
+    book_started=asyncio.Event();history_started=asyncio.Event();release=asyncio.Event();calls=[]
+    async def quotes(symbols):calls.append('quote');return []
+    async def depth(symbol):book_started.set();await release.wait();return None
+    async def bars(symbol,**kwargs):
+        assert kwargs.get('live') is True
+        history_started.set();await release.wait()
+        return [Bar(symbol,'longbridge',stamp('2026-09-21T01:55Z'),100,101,99,100,1000,100000)]
+    d.lb.quotes=quotes;d.lb.depth=depth;d.lb.bars=bars
+    async def run():
+        await asyncio.wait_for(d.refresh_live(),1)
+        await book_started.wait();await history_started.wait()
+        book_task=d.live_books_task;history_task=d.live_benchmark_task
+        await asyncio.wait_for(d.refresh_live(),1)
+        assert calls==['quote','quote'] and d.live_books_task is book_task and d.live_benchmark_task is history_task
+        assert not book_task.done() and not history_task.done()
+        release.set();await asyncio.gather(book_task,history_task)
+    asyncio.run(run())
+
+def test_live_benchmark_only_fetches_new_complete_bars_or_reconnect(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);clock=[stamp('2026-09-21T03:30:05Z')];calls=[]
+    assert d.live_benchmark_target(stamp('2026-09-21T01:31Z'),'CN')==stamp('2026-09-18T07:00Z')
+    monkeypatch.setattr('app.service.now',lambda:clock[0]);d.lb.ctx=object()
+    async def bars(symbol,**kwargs):
+        calls.append(clock[0]);end=d.live_benchmark_target(clock[0],'CN')
+        return [Bar(symbol,'longbridge',end-timedelta(minutes=5),100,101,99,100,1000,100000)]
+    d.lb.bars=bars
+    async def run():
+        await d.refresh_live_benchmarks(['600001.SH'])
+        for text in ('2026-09-21T03:35Z','2026-09-21T04:00Z','2026-09-21T05:03Z'):
+            clock[0]=stamp(text);await d.refresh_live_benchmarks(['600001.SH'])
+        assert len(calls)==1 and d.strategies.benchmarks['CN'][-1].end==stamp('2026-09-21T03:30Z')
+        clock[0]=stamp('2026-09-21T05:05:02Z');await d.refresh_live_benchmarks(['600001.SH'])
+        assert len(calls)==2 and d.strategies.benchmarks['CN'][-1].end==stamp('2026-09-21T05:05Z')
+        d.lb.ctx=object();await d.refresh_live_benchmarks(['600001.SH'])
+        assert len(calls)==3
+    asyncio.run(run())
+
+def test_live_provider_history_and_quotes_bypass_cold_history_and_depth_locks():
+    from types import SimpleNamespace
+    from app.providers import Longbridge
+    lb=Longbridge();lb.ctx=SimpleNamespace(quote=lambda symbols:[],candlesticks=lambda *args:[])
+    async def run():
+        async with lb.history_lock,lb.research_history_lock,lb.depth_lock:
+            assert await asyncio.wait_for(lb.quotes(['600001.SH']),1)==[]
+            assert await asyncio.wait_for(lb.bars('000300.SH',live=True),1)==[]
+    asyncio.run(run())
 
 def test_source_query_text_preserved_and_scope_filtered(tmp_path):
     d=Dashboard(tmp_path)

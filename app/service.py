@@ -57,6 +57,7 @@ class Dashboard:
         self.alerts=Alerts(self.store,root);self.books={};self.decisions=[];self.exit_plans=[];self.real_plans=[]
         self.research_ready={};self.research_progress={};self.benchmark_daily={};self.last_live=0.;self.last_research=0.
         self.last_decision_eval=0.
+        self.last_market_broadcast=0.;self.market_broadcast_handle=None
         self.started_at=time.monotonic()
         self.monitor_running=self.store.get("monitor_running",True);self.runtime_ok=None
         self.manual_watch=self.store.get("manual_watch",[]);self.live_task=None;self.access_task=None;self.access_pending=False;self.ib_connect_task=None
@@ -99,6 +100,22 @@ class Dashboard:
     def broadcast(self):
         for event in self.listeners:event.set()
 
+    def broadcast_market_data(self):
+        """Notify the page promptly, coalescing quote/book bursts to once a second."""
+        remaining=1-(time.monotonic()-self.last_market_broadcast)
+        if remaining<=0:
+            if self.market_broadcast_handle:self.market_broadcast_handle.cancel()
+            self.flush_market_broadcast()
+        elif self.market_broadcast_handle is None:
+            try:loop=asyncio.get_running_loop()
+            except RuntimeError:return
+            self.market_broadcast_handle=loop.call_later(remaining,self.flush_market_broadcast)
+
+    def flush_market_broadcast(self):
+        self.market_broadcast_handle=None
+        if not self.alive:return
+        self.last_market_broadcast=time.monotonic();self.broadcast()
+
     async def start(self):
         import os
         (self.root/'.local/server.pid').write_text(str(os.getpid()))
@@ -119,6 +136,8 @@ class Dashboard:
 
     async def stop(self):
         self.alive=False
+        if self.market_broadcast_handle:
+            self.market_broadcast_handle.cancel();self.market_broadcast_handle=None
         authorization=getattr(self.lb,'authorization_task',None)
         if authorization:
             authorization.cancel()
@@ -161,6 +180,7 @@ class Dashboard:
         tick=time.monotonic()
         if tick-self.last_decision_eval>=1:
             self.evaluate_decisions();self.last_decision_eval=tick
+        self.broadcast_market_data()
 
     def tracked(self):
         held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
@@ -604,6 +624,7 @@ class Dashboard:
         tick=time.monotonic()
         if tick-self.last_decision_eval>=1:
             self.evaluate_decisions();self.last_decision_eval=tick
+        self.broadcast_market_data()
 
     def suspend(self,symbol,reason):
         detail=self.details.setdefault(symbol,{})
@@ -648,6 +669,7 @@ class Dashboard:
         tick=time.monotonic()
         if tick-self.last_decision_eval>=1:
             self.evaluate_decisions();self.last_decision_eval=tick
+        self.broadcast_market_data()
 
     def update_manual_trails(self,bar):
         changed=False
@@ -970,7 +992,7 @@ class Dashboard:
         if not monitored:return 'snapshot','即时快照'
         if symbol in self.lb.subscribed and self.lb.status.get('stream'):
             return 'push','实时盯盘'
-        if self.lb.ctx:return 'polling','15秒查询'
+        if self.lb.ctx:return 'polling','约5秒查询'
         return 'unavailable','行情不可用'
 
     @staticmethod
@@ -987,7 +1009,7 @@ class Dashboard:
         if not monitoring_window(now(),market):return 'stopped','当前时段不请求新行情',subscribed
         if tracked and subscribed>=ready>0 and self.lb.status.get('stream'):
             return 'push','行情推送',subscribed
-        if tracked and self.lb.ctx:return 'polling','15秒查询补充',subscribed
+        if tracked and self.lb.ctx:return 'polling','约5秒查询补充',subscribed
         return 'unavailable','行情连接不可用',subscribed
 
     async def analyze_stock(self,data):
@@ -2028,8 +2050,19 @@ class Dashboard:
     async def refresh_live(self):
         active=[s for s in self.tracked() if monitoring_window(now(),symbol_market(s))]
         if not active:return
+        # Quote polling completes independently of slower books/history. Each
+        # auxiliary worker has at most one outstanding request chain.
+        for attr,worker in (('live_books_task',self.refresh_live_books),('live_benchmark_task',self.refresh_live_benchmarks)):
+            task=getattr(self,attr,None)
+            if not task or task.done():
+                task=asyncio.create_task(worker(active));setattr(self,attr,task);self.tasks.append(task)
         try:
             for q in await self.lb.quotes(active):self.accept_quote(q)
+            self.evaluate_decisions();self.runtime_ok=now().isoformat()
+        except Exception as exc:self.store.event('monitor',{'message':'行情轮询暂未完成，等待重试','error_type':type(exc).__name__})
+
+    async def refresh_live_books(self,active):
+        try:
             # Books are queried only for active holdings or currently valid technical signals.
             needed=set(s for a in self.sim.state['accounts'].values() for s in a['positions'])
             needed.update(self.research_real_symbols())
@@ -2038,30 +2071,51 @@ class Dashboard:
                           if r.get('version')==active_versions.get((symbol_market(r['symbol']),r.get('strategy')))
                           and stamp(r['time'])<=now()<stamp(r['time'])+timedelta(minutes=int(r.get('evidence',{}).get('signal_minutes',5))))
             for symbol in [s for s in active if s in needed]:
+                if not self.monitor_running or not monitoring_window(now(),symbol_market(symbol)):continue
                 try:
                     book=await self.lb.depth(symbol)
-                    if book:
-                        self.books[symbol]=book
-                        q=self.quotes.get(symbol)
-                        if q and q.source==book['source']:
-                            for k in ['bid','ask','bid_size','ask_size','depth_time']:setattr(q,k,book[k])
+                    if book:self.accept_depth({'symbol':symbol,**book})
                 except Exception:pass
-            # Rebuild the benchmark whenever this market is inside its monitoring
-            # window. This also covers an A-share lunch-break wake/reconnect: the
-            # stock history may already include the 11:25 bar while the in-memory
-            # benchmark still stops before sleep. Waiting for 13:00 would make all
-            # candidates look unsynchronised even though the data feed is healthy.
-            active_markets={symbol_market(symbol) for symbol in active}
-            for market in ['CN','US']:
-                if market in active_markets:
-                    try:
-                        bars=await self.lb.bars(BENCHMARKS[market])
-                        self.strategies.set_benchmark(market,[b for b in bars if b.final and b.end<=now()])
-                        self.store.bars_many([b for b in bars if b.final and b.end<=now()])
-                    except Exception as exc:
-                        self.store.event('monitor',{'message':f'{market}基准K线暂未补齐，等待重试','error_type':type(exc).__name__})
-            self.evaluate_decisions();self.runtime_ok=now().isoformat()
-        except Exception as exc:self.store.event('monitor',{'message':'行情轮询暂未完成，等待重试','error_type':type(exc).__name__})
+        except Exception as exc:self.store.event('monitor',{'message':'盘口补查暂未完成，等待重试','error_type':type(exc).__name__})
+
+    @staticmethod
+    def live_benchmark_target(t,market):
+        """End of the latest complete bar, excluding lunch/non-trading minutes."""
+        import pandas as pd
+        cal=calendar(market);day=str(local_date(t,market))
+        opened=cal.session_open(day).to_pydatetime();closed=cal.session_close(day).to_pydatetime()
+        break_start=cal.session_break_start(day);break_end=cal.session_break_end(day)
+        segments=[(opened,closed)] if pd.isna(break_start) else [(opened,break_start.to_pydatetime()),(break_end.to_pydatetime(),closed)]
+        ends=[]
+        for start,end in segments:
+            count=int((min(t,end)-start).total_seconds()//300)
+            if count>0:ends.append(start+timedelta(minutes=5*count))
+        return max(ends) if ends else cal.session_close(cal.previous_session(day)).to_pydatetime()
+
+    async def refresh_live_benchmarks(self,active):
+        attempts=getattr(self,'live_benchmark_attempts',{})
+        self.live_benchmark_attempts=attempts
+        for market in sorted({symbol_market(s) for s in active}):
+            if not self.monitor_running or not monitoring_window(now(),market):continue
+            try:
+                target=self.live_benchmark_target(now(),market)
+                existing=self.strategies.benchmarks.get(market,[])
+                previous=attempts.get(market,{})
+                same_connection=previous.get('context') is self.lb.ctx
+                # On restart/reconnect verify once even if a cached tail exists.
+                # Afterwards request only a newly completed bar or a missing tail.
+                if same_connection and existing and (target is None or existing[-1].end>=target):continue
+                if same_connection and previous.get('target')==target and time.monotonic()-previous['attempted_at']<30:continue
+                attempts[market]={'context':self.lb.ctx,'attempted_at':time.monotonic(),'target':target}
+                bars=await self.lb.bars(BENCHMARKS[market],live=True)
+                bars=[b for b in bars if b.final and b.valid() and b.end<=now() and is_open(b.start,market)]
+                if not bars:raise ValueError('完整基准K线暂不可用')
+                latest=self.strategies.benchmarks.get(market,[])
+                if not latest or bars[-1].end>=latest[-1].end:self.strategies.set_benchmark(market,bars)
+                self.store.bars_many(bars)
+                self.evaluate_decisions();self.broadcast()
+            except Exception as exc:
+                self.store.event('monitor',{'message':f'{market}基准K线暂未补齐，等待重试','error_type':type(exc).__name__})
 
     def refresh_research_context(self):
         """Refresh cached breadth/industry research without blocking quote handling."""

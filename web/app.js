@@ -12,7 +12,7 @@ const savedMarket=readLocal('shortlist-market','CN');
 let currentMarket=validMarkets.includes(query.get('market'))?query.get('market'):(validMarkets.includes(savedMarket)?savedMarket:'CN');
 let currentView=validViews.includes(query.get('view'))?query.get('view'):'today';
 let holdingKind='real',riskFilter='all',strategyHorizon='all',selectedSymbol=null,selectedStrategy='breakout',analysisResult=null,chartBars=[],chartLoadedAt=0,refreshTimer=null,stateRefreshing=false,stateRefreshQueued=false;
-let analysisRefreshing=false,lastAnalysisRefresh=0;
+let analysisRefreshing=false,lastAnalysisRefresh=0,refreshFallbackTimer=null;
 let gptBundle=null,gptRun=null,gptMode='auto';
 const researchComparisons={};
 let manualHistory={at:0,rows:[],loading:false},executionContext=null;
@@ -36,22 +36,60 @@ function riskName(value){return ({normal:'普通股',smallcap:'高波动小盘',
 function time(value,zone='Asia/Shanghai',withDate=true){if(!value)return '时间未提供';try{return new Intl.DateTimeFormat('zh-CN',{timeZone:zone,month:withDate?'2-digit':undefined,day:withDate?'2-digit':undefined,hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(value))}catch{return '时间无效'}}
 function dateOnly(value,zone='Asia/Shanghai'){if(!value)return '—';try{return new Intl.DateTimeFormat('zh-CN',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(value))}catch{return '—'}}
 function toast(message){const node=$('#toast');node.textContent=message;node.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>node.style.display='none',4200)}
-async function api(path,body){const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-Dashboard-Local':'1'},body:JSON.stringify(body)};const response=await fetch(path,options);let data={};try{data=await response.json()}catch{}if(!response.ok)throw new Error(typeof data.detail==='object'?(data.detail.message||'操作未完成'):(data.detail||'操作未完成'));return data}
+async function api(path,body,signal){const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-Dashboard-Local':'1'},body:JSON.stringify(body)};if(signal)options.signal=signal;const response=await fetch(path,options);let data={};try{data=await response.json()}catch{}if(!response.ok)throw new Error(typeof data.detail==='object'?(data.detail.message||'操作未完成'):(data.detail||'操作未完成'));return data}
 async function action(path,body={},message='已完成'){try{await api(path,body);toast(message);await refresh();return true}catch(error){toast(error.message);return false}}
 function workspace(){return state?.workspaces?.[currentMarket]}
 function updateUrl(){const url=new URL(location.href);url.searchParams.set('market',currentMarket);url.searchParams.set('view',currentView);history.replaceState(null,'',url)}
 function showView(view){currentView=validViews.includes(view)?view:'today';$$('.page').forEach(node=>node.classList.toggle('hidden',node.id!==currentView));$$('[data-view]').forEach(node=>node.classList.toggle('active',node.dataset.view===currentView));updateUrl();if(state)renderCurrent()}
 function setMarket(market){if(!validMarkets.includes(market))return;currentMarket=market;writeLocal('shortlist-market',market);document.documentElement.dataset.market=market;$$('[data-workspace]').forEach(node=>node.classList.toggle('selected',node.dataset.workspace===market));selectedSymbol=null;chartBars=[];chartLoadedAt=0;clearGptPreview();updateUrl();if(state)render()}
-function scheduleRefresh(){
+function scheduleRefresh(immediate=false){
+  if(document.visibilityState==='hidden')return;
   if(stateRefreshing){stateRefreshQueued=true;return}
-  clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,500)
+  if(immediate===true){clearTimeout(refreshTimer);refreshTimer=null;void refresh();return}
+  // Keep the first deadline: frequent pushes must never postpone a refresh.
+  if(refreshTimer!==null)return;
+  refreshTimer=setTimeout(()=>{refreshTimer=null;if(document.visibilityState!=='hidden')void refresh()},500);
+}
+function armRefreshFallback(){
+  clearTimeout(refreshFallbackTimer);
+  refreshFallbackTimer=setTimeout(()=>{
+    refreshFallbackTimer=null;
+    if(document.visibilityState!=='hidden'&&!stateRefreshing&&refreshTimer===null)scheduleRefresh(true);
+    armRefreshFallback();
+  },document.visibilityState==='hidden'?30000:5000);
+}
+function resumeStateUpdates(){
+  armRefreshFallback();
+  if(document.visibilityState!=='hidden')scheduleRefresh(true);
+  else{clearTimeout(refreshTimer);refreshTimer=null;stateRefreshQueued=false}
+}
+function stateDisconnected(message){
+  document.body.classList.add('disconnected');
+  if(state&&currentView==='today')renderToday();
+  $('#market-phase').textContent='本地状态待恢复';$('#market-clock').textContent=message;
+}
+function renderStateUpdate(){
+  const editing=document.activeElement?.matches('input,textarea,select,[contenteditable="true"]');
+  if(editing&&['strategies','system','gpt'].includes(currentView)){
+    const w=workspace();if(w)renderShell(w);return;
+  }
+  render();
 }
 async function refresh(){
   if(stateRefreshing){stateRefreshQueued=true;return}
-  stateRefreshing=true
-  try{state=await api('/api/state');if(!state.workspaces)throw new Error('后台正在更新，请稍后刷新');document.body.classList.remove('disconnected');if(analysisResult)analysisResult.monitored=state.watch.includes(analysisResult.symbol);render();refreshMonitoredAnalysis()}
-  catch(error){document.body.classList.add('disconnected');$('#market-phase').textContent='本地服务未连接';$('#market-clock').textContent=error.message}
-  finally{stateRefreshing=false;if(stateRefreshQueued){stateRefreshQueued=false;scheduleRefresh()}}
+  clearTimeout(refreshTimer);refreshTimer=null;stateRefreshing=true;
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),8000);
+  try{
+    const next=await api('/api/state',undefined,controller.signal);if(!next.workspaces)throw new Error('后台正在更新，请稍后刷新');
+    state=next;document.body.classList.remove('disconnected');
+    if(analysisResult)analysisResult.monitored=state.watch.includes(analysisResult.symbol);
+    renderStateUpdate();refreshMonitoredAnalysis();
+  }
+  catch(error){stateDisconnected(error.name==='AbortError'?'状态读取超时，正在自动重试':error.message)}
+  finally{
+    clearTimeout(timeout);stateRefreshing=false;armRefreshFallback();
+    if(stateRefreshQueued){stateRefreshQueued=false;scheduleRefresh()}
+  }
 }
 
 function render(){const w=workspace();if(!w)return;renderShell(w);renderCurrent()}
@@ -389,7 +427,8 @@ function bindEvents(){
 async function openVersions(strategy){try{const rows=await api(`/api/strategies/${strategy}/versions?market=${currentMarket}`);$('#versions-title').textContent=`${strategyName(strategy)} · 参数历史`;$('#versions-content').innerHTML=rows.map((row,index)=>`<div class="version-row"><div><b>${esc(row.version)}</b><small>${esc(time(row.created_at))} · ${esc(row.reason)}</small>${row.replay?`<small>${esc(row.replay.label||'历史探索结果')} · ${esc(row.replay.message||row.replay.state)}</small>`:'<small>历史探索结果尚未运行</small>'}</div><span class="state-chip ${index===0?'buy':''}">${index===0?'当前版本':'历史版本'}</span>${index? `<button class="secondary" data-rollback="${esc(row.version)}" data-strategy="${esc(strategy)}">恢复此版</button>`:''}<details><summary>查看参数与差异</summary><pre>${esc(JSON.stringify(row.parameters,null,2))}</pre></details></div>`).join('');$('#versions-dialog').showModal()}catch(error){toast(error.message)}}
 
 document.documentElement.dataset.market=currentMarket;showView(currentView);bindEvents();setGptMode('auto');restoreAnalysisSession();refresh();
-try{const events=new EventSource('/api/events');events.onmessage=scheduleRefresh;events.onerror=()=>{document.body.classList.add('disconnected');if(state&&currentView==='today')renderToday()}}catch{}
+document.addEventListener('visibilitychange',resumeStateUpdates);window.addEventListener('online',resumeStateUpdates);armRefreshFallback();
+try{const events=new EventSource('/api/events');events.onmessage=()=>scheduleRefresh();events.onerror=()=>stateDisconnected('状态推送中断，正在自动重新连接')}catch{}
 
 
 function renderAutoResearch(w){
