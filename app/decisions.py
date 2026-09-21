@@ -34,6 +34,7 @@ def check(signal,q,validation,account,cfg,t,active_versions=None):
     if signal.version!=expected:return reject('旧版历史信号，不作为当前买入建议','avoid')
     if not signal.time<=t<signal.time+timedelta(minutes=valid_minutes):return reject('买点已过期，等待新信号','avoid')
     if not is_open(t,m):return reject('当前不是正常交易时段')
+    if validation.get('research_eligible') is False:return reject('本轮研究资格失效或数据待恢复')
     if not validation.get('ready') or not validation.get('eligible') or validation.get('source')!=signal.source:
         return reject('行情数据或交易范围尚未通过核验')
     if not fresh_quote(q,t,signal.source):return reject('等待已验证的同源新报价')

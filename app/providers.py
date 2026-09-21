@@ -127,12 +127,33 @@ class Longbridge(Provider):
         super().__init__();self.ctx=None;self.auth_url=None;self.auth_running=False
         self.loop=None;self.on_quote=None;self.on_bar=None;self.subscribed=set();self.auth_thread=None
         self.units={};self.exchanges={};self.quote_meta={};self.last_push_dispatch={}
+        self.history_lock=asyncio.Lock();self.background_lock=asyncio.Lock();self.cli_lock=asyncio.Lock()
+        self.depth_subscribed=set();self.on_depth=None;self.last_depth_dispatch={};self.io_metrics={};self.next_cli=0.
         self.status.update(state='auth_required',message='SDK持续行情需要授权；可先读取现有CLI数据')
 
     async def cli_scan(self,market,count=80):
-        async with self.lock:
-            # CLI indicator metadata defines marketcap in 100-million currency units.
-            return await command('longbridge','screener','filter','prevclose:2:','marketcap:0.5:','--market',market,'--count',str(count),'--format','json',timeout=25)
+        return await self.background_command('longbridge','screener','filter','prevclose:2:','marketcap:0.5:',
+            '--market',market,'--count',str(count),'--format','json')
+
+    async def background_command(self,*args,timeout=25):
+        queued=time.monotonic()
+        async with self.cli_lock:
+            await asyncio.sleep(max(0,self.next_cli-time.monotonic()))
+            started=time.monotonic()
+            try:
+                result=await command(*args,timeout=timeout)
+                self.io_metrics.update(last_background_error=None)
+                return result
+            except Exception as exc:
+                self.io_metrics['last_background_error']=str(exc)
+                raise
+            finally:
+                self.next_cli=time.monotonic()+.6
+                self.io_metrics.update(background_queue_ms=round((started-queued)*1000),background_request_ms=round((time.monotonic()-started)*1000))
+
+    async def universe_page(self,page,count=100):
+        return await self.background_command('longbridge','screener','filter','--market','CN',
+            '--sort','marketcap','--order','desc','--page',str(page),'--count',str(count),'--format','json')
 
     async def account_positions(self):
         """Read current long stock positions through the installed CLI."""
@@ -196,7 +217,7 @@ class Longbridge(Provider):
         if not self.ctx:return {}
         result={}
         for start in range(0,len(symbols),30):
-            async with self.lock:
+            async with self.background_lock:
                 rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.static_info,symbols[start:start+30]),15)
             for r in rows:
                 result[r.symbol]={'name':r.name_cn or r.name_en,'total_shares':number(r.total_shares),'exchange':r.exchange}
@@ -208,9 +229,9 @@ class Longbridge(Provider):
         if symbol.endswith(('.SH','.SZ')):return 'a-shares' in descriptions
         return ('us real-time' in descriptions or 'us stocks' in descriptions or ('nasdaq real-time' in descriptions and 'NAS' in self.exchanges.get(symbol,'').upper()))
 
-    async def quotes(self,symbols):
+    async def quotes(self,symbols,background=False):
         if not self.ctx or not symbols:return []
-        async with self.lock:
+        async with (self.background_lock if background else self.lock):
             rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.quote,symbols),15)
         result=[]
         for r in rows:
@@ -236,7 +257,7 @@ class Longbridge(Provider):
     async def history_day(self,symbol,day):
         from longbridge.openapi import Period,AdjustType,TradeSessions
         if not self.ctx:raise ValueError('持续接口未连接')
-        async with self.lock:
+        async with self.history_lock:
             rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.history_candlesticks_by_date,symbol,Period.Min_5,AdjustType.NoAdjust,day,day,TradeSessions.Intraday),20)
         result=[]
         for r in rows:
@@ -246,13 +267,13 @@ class Longbridge(Provider):
         return result
 
     async def bars(self,symbol,period='5m',count=250,force_cli=False):
-        async with self.lock:
+        async with self.history_lock:
             if self.ctx and not force_cli:
                 from longbridge.openapi import Period,AdjustType
                 rows=await asyncio.wait_for(asyncio.to_thread(self.ctx.candlesticks,symbol,Period.Day if period=='day' else Period.Min_5,count,AdjustType.NoAdjust),20)
                 data=[{'time':sdk_stamp(r.timestamp),'open':r.open,'high':r.high,'low':r.low,'close':r.close,'volume':r.volume,'turnover':r.turnover} for r in rows]
             else:
-                data=await command('longbridge','kline',symbol,'--period',period,'--count',str(count),'--adjust','none','--format','json',timeout=20)
+                data=await self.background_command('longbridge','kline',symbol,'--period',period,'--count',str(count),'--adjust','none','--format','json',timeout=20)
         result=[]
         for r in data:
             t=stamp(r.get('time',r.get('timestamp')))
@@ -298,6 +319,7 @@ class Longbridge(Provider):
                 self.ctx=QuoteContext(config)
                 self.ctx.set_on_quote(self._quote)
                 self.ctx.set_on_candlestick(self._bar)
+                self.ctx.set_on_depth(self._depth)
                 self.auth_url=None;self.status.update(state='connected',message='SDK持续连接已建立',stream=True,authorized=True,last_ok=now().isoformat())
             except Exception:
                 self.status.update(state='auth_required',message='长桥持续连接未建立，请使用授权按钮重试')
@@ -354,6 +376,20 @@ class Longbridge(Provider):
             if self.on_quote and self.loop:self.loop.call_soon_threadsafe(self.on_quote,q)
         except Exception:pass
 
+    def _depth(self,symbol,event):
+        try:
+            tick=time.monotonic()
+            if tick-self.last_depth_dispatch.get(symbol,0)<.25:return
+            self.last_depth_dispatch[symbol]=tick
+            bid=next((r for r in event.bids if number(r.price,0)>0),None)
+            ask=next((r for r in event.asks if number(r.price,0)>0),None)
+            if not bid or not ask:return
+            book={'symbol':symbol,'source':'longbridge','bid':number(bid.price),'ask':number(ask.price),
+                  'bid_size':number(bid.volume),'ask_size':number(ask.volume),'depth_time':now(),
+                  'time_basis':'received_at','sequence':getattr(event,'sequence',None)}
+            if self.on_depth and self.loop:self.loop.call_soon_threadsafe(self.on_depth,book)
+        except Exception:pass
+
     def _bar(self,symbol,event):
         try:
             r=event.candlestick
@@ -372,10 +408,15 @@ class Longbridge(Provider):
                 await asyncio.to_thread(self.ctx.unsubscribe,[s],[SubType.Quote])
                 await asyncio.to_thread(self.ctx.unsubscribe_candlesticks,s,Period.Min_5)
                 self.subscribed.remove(s)
+                if s in self.depth_subscribed:
+                    await asyncio.to_thread(self.ctx.unsubscribe,[s],[SubType.Depth]);self.depth_subscribed.discard(s)
             for s in target-self.subscribed:
                 await asyncio.to_thread(self.ctx.subscribe,[s],[SubType.Quote])
                 await asyncio.to_thread(self.ctx.subscribe_candlesticks,s,Period.Min_5,TradeSessions.Intraday)
                 self.subscribed.add(s)
+                try:
+                    await asyncio.to_thread(self.ctx.subscribe,[s],[SubType.Depth]);self.depth_subscribed.add(s)
+                except Exception:self.status["depth_message"]="盘口推送权限待核验，使用限频轮询"
 
     async def healthcheck(self):
         if not self.ctx:return False

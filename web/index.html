@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>短线观察台 · 双市场工作区</title>
   <script>if(location.protocol==='file:')location.replace('http://127.0.0.1:8765/'+location.search+location.hash)</script>
-  <link rel="stylesheet" href="/assets/style.css?v=7">
-  <script src="/assets/app.js?v=7" defer></script>
+  <link rel="stylesheet" href="/assets/style.css?v=8">
+  <script src="/assets/app.js?v=8" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -43,6 +43,7 @@
           <div class="title-actions"><button class="secondary" data-ask-gpt="market">问 GPT</button><button class="secondary" data-go="premarket">查看盘前名单 →</button></div>
         </div>
         <div class="health-strip" id="health-strip"></div>
+        <section class="panel" id="auto-research-panel"></section>
         <section id="decision-hero" class="decision-hero"></section>
         <div class="decision-layout">
           <section class="primary-slot" id="primary-decision"></section>
@@ -56,7 +57,7 @@
       </section>
 
       <section class="page hidden" id="premarket">
-        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>A股先由灵犀按启用策略查询全市场，再由本地日线复核；只有完整5分钟买点和实时执行检查全部通过后，才会进入今日决策。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="scan">让 GPT 深研今日候选</button><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div></div>
+        <div class="page-title"><div><span class="kicker" id="premarket-kicker">A股 · 盘前观察</span><h1>盘前选出，盘中确认</h1><p>A股分页更新基础证券库，按策略复核后形成动态研究池；盘中继续发现池外候选。观察名单不等于买点。</p></div><div class="title-actions"><button class="secondary" data-ask-gpt="scan">让 GPT 深研今日候选</button><button class="primary" id="refresh-premarket">重新运行全市场策略筛选</button></div></div>
         <div class="health-strip compact" id="premarket-summary"></div>
         <div class="scope-note" id="premarket-scope"></div>
         <div class="screener-layout">
@@ -80,6 +81,7 @@
       <section class="page hidden" id="review">
         <div class="page-title"><div><span class="kicker" id="review-kicker">A股 · 复盘研究</span><h1>只评估当前市场</h1><p>收益均扣除估计成本；样本不足30笔时不宣称策略有效。</p></div><button class="secondary" id="toggle-simulation">暂停模拟新开仓</button></div>
         <div id="review-account"></div>
+        <section class="panel" id="research-review"></section>
         <div class="two-columns"><section class="panel"><div class="panel-head"><div><span class="kicker">策略影子模拟</span><h2>逐策略公平比较</h2><p>不受其他策略资金竞争影响；组合账户仍单独统计。</p></div></div><div id="strategy-metrics"></div></section><section class="panel"><div class="panel-head"><div><span class="kicker">未成交</span><h2>失败与取消</h2></div></div><div id="market-failures"></div></section></div>
         <section class="panel"><div class="panel-head"><div><span class="kicker">前向样本</span><h2>已结束交易</h2></div></div><div id="market-trades"></div></section>
         <section class="panel"><div class="panel-head"><div><span class="kicker">候选复核</span><h2>单股历史回放</h2><p>使用本机已有完整K线，前70%预热，后30%按固定规则检查。</p></div></div><div class="inline-form"><select id="replay-symbol"></select><button class="secondary" id="run-replay">开始回放</button></div><div id="replay-result" class="result-box"></div></section>
@@ -168,6 +170,7 @@
     </form>
   </dialog>
 
+  <dialog id="research-history-dialog"><div class="dialog-card"><div class="dialog-head"><h2>候选跟踪记录</h2><button class="close-button" data-close="research-history-dialog">×</button></div><div id="research-history-content"></div></div></dialog>
   <dialog id="versions-dialog">
     <div class="dialog-card"><div class="dialog-head"><div><span class="kicker">参数历史</span><h2 id="versions-title">策略版本</h2></div><button type="button" class="close-button" data-close="versions-dialog">×</button></div><div id="versions-content"></div></div>
   </dialog>

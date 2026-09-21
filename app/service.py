@@ -2,6 +2,7 @@ import asyncio,json,time,re,statistics
 from uuid import uuid4
 from pathlib import Path
 from datetime import timedelta
+from .autoresearch import AutoResearch,complete_daily,daily_cutoff,rotate_monitoring
 from .models import now,stamp,symbol_market,in_scope,Bar,Signal
 from .providers import ROOT,Lingxi,Longbridge,IBKR,number,canonical
 from .calendars import is_open,local_date,adjacent,price_limits,phase
@@ -69,6 +70,7 @@ class Dashboard:
         self.last_bars_cycle=0.;self.last_quote_cycle=0.;self.last_scan_cycle=0.;self.validation={};self.first_poll=True
         self.lb.on_quote=self.accept_quote;self.lb.on_bar=self.accept_bar
         self.sdk_checked=None
+        self.last_monitor_round=None
         self.ib_auto_connect=self.store.get('ib_auto_connect',False);self.last_ib_attempt=0.
         self.selection=sorted(self.store.get('selection',[]),key=selection_rank);self.selection_running=False
         self.selection_progress={'done':0,'total':0};self.selection_errors=[];self.selection_task=None
@@ -85,6 +87,8 @@ class Dashboard:
         p=root/'.local/vendor/gtht/lingxi-realtimemarketdata-skill/stock_code_name.json'
         try:self.security_map={canonical(r['code']):r for r in json.loads(p.read_text())['items']}
         except (FileNotFoundError,KeyError):self.security_map={}
+        self.autoresearch=AutoResearch(self)
+        self.lb.on_depth=self.accept_depth
 
     def broadcast(self):
         for event in self.listeners:event.set()
@@ -98,7 +102,7 @@ class Dashboard:
             self.sim.save();self.store.set('engine_version',VERSION)
         self.tasks=[asyncio.create_task(self.lb.connect_cached()),asyncio.create_task(self.run()),asyncio.create_task(self.live_loop()),
                     asyncio.create_task(self.research_loop()),asyncio.create_task(self.holdings_loop()),
-                    asyncio.create_task(self.alerts.worker())]
+                    asyncio.create_task(self.alerts.worker()),asyncio.create_task(self.autoresearch.loop())]
 
     async def stop(self):
         self.alive=False
@@ -110,9 +114,43 @@ class Dashboard:
         await asyncio.gather(*self.tasks,return_exceptions=True)
         if self.ib.ib:self.ib.ib.disconnect()
 
+    def research_real_holdings(self):
+        return self.real.list() if self.settings.get('account_mode',False) else []
+
+    def research_real_symbols(self):
+        return [r['symbol'] for r in self.research_real_holdings()]
+
+    def research_entry_allowed(self,symbol):
+        if symbol_market(symbol)!='CN' or not self.autoresearch.status:return True
+        row=next((r for r in self.selection if r['symbol']==symbol),None)
+        if row:
+            return (row.get('checked_session')==str(local_date(now(),'CN')) and row.get('decision')!='暂不参与'
+                    and row.get('data_quality')=='complete' and row.get('name_verified',False))
+        # Explicitly pinned research can run outside the automatic 80-name pool;
+        # the existing quote, strategy and execution gates still apply.
+        return symbol in self.manual_watch
+
+    def protected_monitoring(self):
+        held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
+        pending=[r['symbol'] for r in list(self.sim.state['pending'].values())+list(self.sim.state['shadow']['pending'].values())
+                 if stamp(r['time'])<=now()<stamp(r['time'])+timedelta(minutes=int(r.get('evidence',{}).get('signal_minutes',5)))]
+        return list(dict.fromkeys(self.research_real_symbols()+held+self.manual_watch+pending))
+
+    def accept_depth(self,book):
+        symbol=book['symbol'];previous=self.books.get(symbol,{})
+        if previous.get('depth_time') and book['depth_time']<previous['depth_time']:return
+        self.books[symbol]=book
+        q=self.quotes.get(symbol)
+        if q and q.source==book['source']:
+            for k in ('bid','ask','bid_size','ask_size','depth_time'):setattr(q,k,book[k])
+        self.evaluate_decisions()
+
     def tracked(self):
         held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
-        return list(dict.fromkeys(self.real.symbols()+held+self.watch))[:self.settings['monitor_limit']]
+        symbols=list(dict.fromkeys(self.research_real_symbols()+held+self.watch))
+        symbols.sort(key=lambda s:not monitoring_window(now(),symbol_market(s)))
+        limit=min(12,self.settings['monitor_limit']) if monitoring_window(now(),'CN') else self.settings['monitor_limit']
+        return symbols[:limit]
 
     async def run(self):
         while self.alive:
@@ -145,7 +183,7 @@ class Dashboard:
                         self.tasks.append(self.access_task)
                 if self.first_poll:
                     marker=self.store.get('premarket_scan_marker',{})
-                    due=[m for m in ['CN','US'] if marker.get(m)!=self.candidate_trade_date(m)
+                    due=[m for m in ['US'] if marker.get(m)!=self.candidate_trade_date(m)
                          or self.daily_core.get(m,{}).get('trade_date')!=self.candidate_trade_date(m)
                          or self.daily_core.get(m,{}).get('stale')]
                     if due and not self.scanning:
@@ -156,7 +194,7 @@ class Dashboard:
                     await self.request_scan();self.last_scan_cycle=time.monotonic()
                 elif preparing:
                     marker=self.store.get('premarket_scan_marker',{})
-                    due=[m for m in preparing if marker.get(m)!=self.candidate_trade_date(m)]
+                    due=[m for m in preparing if m!='CN' and marker.get(m)!=self.candidate_trade_date(m)]
                     if due and not self.scanning:
                         task=asyncio.create_task(self.run_premarket_scan(due));self.tasks.append(task)
                 if self.first_poll or any(s not in self.details for s in self.tracked()) or (active and tick-self.last_bars_cycle>60):
@@ -211,7 +249,7 @@ class Dashboard:
                 quotes=await self.ib.quotes(list(dict.fromkeys(['AAPL.US']+[s for s in self.tracked() if s.endswith('.US')]))[:8])
                 for q in quotes:self.accept_quote(q)
                 self.ib.status['verified_symbols']=sorted(self.ib.verified)
-                await self.sync_real_holdings(['ibkr'])
+                if self.settings.get('account_mode',False):await self.sync_real_holdings(['ibkr'])
                 self.first_poll=True;self.broadcast();return True
         self.ib.fail('等待IB Gateway／TWS登录并开启只读API；每30秒自动重试本机端口')
         self.broadcast();return False
@@ -238,7 +276,7 @@ class Dashboard:
         if symbol.endswith('.US') and len(code)>=5 and re.search(r'(W[A-Z]?|R|U)$',code):return False
         if symbol.endswith('.US'):return True
         ref=self.security_map.get(symbol)
-        return bool(ref and str(ref.get('证券类型'))=='1')
+        return bool((ref and str(ref.get('证券类型'))=='1') or row.get('candidate_origin')=='universe' or any(r.get('symbol')==symbol and r.get('candidate_origin')=='universe' for r in self.candidates))
 
     async def strategy_candidate_scan(self,force=False):
         marker=str(local_date(now(),'CN'))
@@ -317,40 +355,12 @@ class Dashboard:
             if force_strategy and rebuild_markets is None:requested={'CN','US'}
             for market in ('CN','US'):
                 core=self.daily_core.get(market,{})
-                if core.get('trade_date')!=self.candidate_trade_date(market):requested.add(market)
+                if market=='US' and core.get('trade_date')!=self.candidate_trade_date(market):requested.add(market)
             rows=[]
             if 'CN' in requested:
-                try:
-                    strategy_rows,status=await self.strategy_candidate_scan(True)
-                    core_rows=[]
-                    for row in strategy_rows:
-                        core_rows.append({**row,'pool_role':'daily_core','candidate_date':self.candidate_trade_date('CN'),
-                                          'candidate_updated_at':scan_time})
-                    longbridge_ok=False
-                    try:
-                        cn=await self.lb.cli_scan('CN')
-                        core_rows.extend(self.longbridge_candidates(cn,'daily_core',scan_time,self.candidate_trade_date('CN')))
-                        longbridge_ok=True
-                    except Exception:pass
-                    if not status.get('queries') and not longbridge_ok:raise RuntimeError('A股每日核心池未返回可验证结果')
-                    core_rows=self.limit_core_rows(core_rows)
-                    self.daily_core['CN']={'trade_date':self.candidate_trade_date('CN'),'updated_at':scan_time,
-                                           'rows':core_rows,'stale':False,'errors':status.get('errors',[])}
-                    rebuilt.add('CN')
-                except Exception:
-                    if self.daily_core.get('CN'):
-                        self.daily_core['CN']={**self.daily_core['CN'],'stale':True,'error':'A股每日核心池刷新失败'}
+                self.autoresearch.request(force=bool(force_strategy))
+                requested.discard('CN')
             rows.extend(self.daily_core.get('CN',{}).get('rows',[]))
-            if is_open(now(),'CN') or phase(now(),'CN')=='集合竞价':
-                for order in [10,2]:
-                    try:found,stats=await self.lingxi.rank(order)
-                    except Exception:found,stats=[],{}
-                    for row in found:
-                        row.update(candidate_origin='rank_supplement',candidate_strategies=[],pool_role='intraday_supplement',
-                                   candidate_date=self.candidate_trade_date('CN'),candidate_updated_at=scan_time)
-                    rows.extend(found)
-                    if stats:self.market_stats=stats
-                    if found:self.market_stats_time=found[0].get('market_time')
             if 'US' in requested:
                 try:
                     us=await self.lb.cli_scan('US')
@@ -371,6 +381,7 @@ class Dashboard:
                 except Exception:
                     if not self.lb.ctx:self.lb.status.update(message='持续行情待授权；美股盘中补充本次未返回')
             self.store.set('daily_candidate_core',self.daily_core)
+            rows=[r for r in rows if symbol_market(r['symbol'])!='CN']+self.daily_core.get('CN',{}).get('rows',[])
             unique={}
             for r in rows:
                 if not self.allowed_security(r):continue
@@ -427,7 +438,7 @@ class Dashboard:
         continuity=[r['symbol'] for r in self.selection if r['decision']=='重点观察'][:8]
         preferred=set(continuity) | set(self.tracked())
         rows=[]
-        for market in ('CN','US'):
+        for market in ('US',):
             rows+=candidate_pool([r for r in self.candidates if r.get('market')==market],
                                  [r for r in retained if symbol_market(r['symbol'])==market],preferred,80)
         existing={r['symbol'] for r in self.candidates}
@@ -450,12 +461,12 @@ class Dashboard:
                     if not self.allowed_security(row):raise ValueError('不在选股范围')
                     key='selection_daily:'+row['symbol']
                     cached=self.store.get(key)
-                    if cached and cached.get('fetched_date')==str(local_date(now(),symbol_market(row['symbol']))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
+                    if cached and cached.get('cutoff')==str(daily_cutoff(now(),symbol_market(row['symbol']))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
                         daily=[Bar.load(b) for b in cached['bars']]
                     else:
                         daily=await self.lb.bars(row['symbol'],'day',DAILY_FETCH_COUNT,force_cli=True)
-                        daily=[b for b in daily if local_date(b.start,symbol_market(row['symbol']))<local_date(now(),symbol_market(row['symbol']))]
-                        self.store.set(key,{'fetched_date':str(local_date(now(),symbol_market(row['symbol']))),'bars':[b.dump() for b in daily]})
+                        daily=complete_daily(daily,now(),symbol_market(row['symbol']))
+                        self.store.set(key,{'fetched_date':str(local_date(now(),symbol_market(row['symbol']))),'cutoff':str(daily_cutoff(now(),symbol_market(row['symbol']))),'bars':[b.dump() for b in daily]})
                     if reference and reference.get('total_shares') and daily:row['market_cap']=daily[-1].close*reference['total_shares']
                     item=evaluate_selection(row,daily)
                     item.update(candidate_origin=row.get('candidate_origin','retained'),candidate_strategies=row.get('candidate_strategies',[]),
@@ -489,7 +500,7 @@ class Dashboard:
             if failed:
                 results.extend(r for r in previous.values() if r.get('market') in failed)
                 self.store.set('daily_candidate_core',self.daily_core)
-            self.selection=sorted(results,key=selection_rank)
+            self.selection=sorted([r for r in self.selection if r.get('market')=='CN']+results,key=selection_rank)
             updated=now().isoformat()
             self.store.set('selection',self.selection);self.store.set('selection_updated',updated)
             updated_by_market=self.store.get('selection_updated_by_market',{})
@@ -511,7 +522,7 @@ class Dashboard:
         held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
         self.store.set('watch_before_priority',self.watch)
         existing=[s for s in self.watch if market=='ALL' or symbol_market(s)==market]
-        self.watch=list(dict.fromkeys(self.real.symbols()+held+self.manual_watch+self.active_gpt_symbols()+preferred+existing))[:self.settings['monitor_limit']]
+        self.watch=list(dict.fromkeys(self.research_real_symbols()+held+self.manual_watch+self.active_gpt_symbols()+preferred+existing))[:self.settings['monitor_limit']]
         self.store.set('watch',self.watch)
         if self.lb.ctx:
             for q in await self.lb.quotes(self.tracked()):self.accept_quote(q)
@@ -554,7 +565,7 @@ class Dashboard:
 
     async def remove_watch(self,symbol):
         if any(symbol in a['positions'] for a in self.sim.state['accounts'].values()):raise ValueError('模拟持仓仍需监测，退出后再移除')
-        if symbol in self.real.symbols():raise ValueError('真实持仓仍需监测；请先在券商端处理或删除手工持仓记录')
+        if symbol in self.research_real_symbols():raise ValueError('真实持仓仍需监测；请先在券商端处理或删除手工持仓记录')
         self.watch=[s for s in self.watch if s!=symbol];self.store.set('watch',self.watch)
         self.manual_watch=[s for s in self.manual_watch if s!=symbol];self.store.set('manual_watch',self.manual_watch)
         self.sim.cancel_pending(symbol,'已移出监测');self.broadcast()
@@ -607,7 +618,7 @@ class Dashboard:
         self.store.bar(b)
         fresh=0<=(now()-b.end).total_seconds()<90
         # Do not execute historical next bars during warm-up or reconnection.
-        eligible=bool(v.get('ready') and v.get('eligible') and fresh)
+        eligible=bool(v.get('ready') and v.get('eligible') and fresh and self.research_entry_allowed(b.symbol))
         if fresh and v.get('ready'):
             self.sim.process(b,allow_entries=eligible and self.settings['simulation_enabled'])
         signals=self.strategies.update(b,v.get('risk_group','pending'))
@@ -628,12 +639,12 @@ class Dashboard:
                     if v.get('daily_checked')!=str(local_date(now(),symbol_market(symbol))):
                         cache_key='selection_daily:'+symbol
                         cached=self.store.get(cache_key,{})
-                        if cached.get('fetched_date')==str(local_date(now(),symbol_market(symbol))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
+                        if cached.get('cutoff')==str(daily_cutoff(now(),symbol_market(symbol))) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN:
                             days=[Bar.load(b) for b in cached['bars']]
                         else:
                             days=await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT)
-                            self.store.set(cache_key,{'fetched_date':str(local_date(now(),symbol_market(symbol))),'bars':[b.dump() for b in days]})
-                        completed=[b for b in days if local_date(b.start,symbol_market(symbol))<local_date(now(),symbol_market(symbol))]
+                            self.store.set(cache_key,{'fetched_date':str(local_date(now(),symbol_market(symbol))),'cutoff':str(daily_cutoff(now(),symbol_market(symbol))),'bars':[b.dump() for b in days]})
+                        completed=complete_daily(days,now(),symbol_market(symbol))
                         if len(completed)<21:raise ValueError('不足21个完整交易日，暂不产生交易信号')
                         recent=completed[-20:];amount=sum(b.turnover or 0 for b in recent)/20
                         atr=sum(max(b.high-b.low,abs(b.high-completed[-21+i].close),abs(b.low-completed[-21+i].close)) for i,b in enumerate(recent))/20
@@ -729,14 +740,14 @@ class Dashboard:
             v=self.validation.get(s,{})
             if v:r.update(risk_group=v.get('risk_group',r.get('risk_group','pending')),eligible=v.get('eligible',False),eligibility_reason=v.get('reason',''),atr_pct=v.get('atr_pct'),average_turnover=v.get('average_turnover'))
             r['market']=symbol_market(s)
-        real_symbols=self.real.symbols();tracked=set(self.tracked())
+        real_symbols=self.research_real_symbols();tracked=set(self.tracked())
         alerts=self.alerts.list(30);simulation=self.sim.summary()
         research_pool=self.store.get('selection_pool',{}).get('rows',[])
         strategy_screen=self.store.get('strategy_candidate_screen',{})
         workspaces={m:self.market_workspace(m,rows,simulation,alerts) for m in ['CN','US']}
         gpt={m:self.gpt_list_runs(m) for m in ['CN','US']}
-        return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 4.2','settings':self.settings,
-                'decisions':self.decisions,'exit_plans':self.exit_plans,'real_holdings':self.real.list(),'real_plans':self.real_plans,
+        return {'time':now().isoformat(),'version':VERSION,'workspace_version':'工作台 5.0 · 自动研究','settings':self.settings,
+                'decisions':self.decisions,'exit_plans':self.exit_plans,'real_holdings':self.research_real_holdings(),'real_plans':self.real_plans,
                 'holding_sync':self.holding_sync,'premarket':{m:self.premarket(m) for m in ['CN','US']},'alerts':alerts,
                 'gpt':gpt,
                 'notification_settings':self.alerts.status(),'monitor':{'running':self.monitor_running,'last_ok':self.runtime_ok,'ai_calls':0,'research':self.research_progress,
@@ -757,7 +768,7 @@ class Dashboard:
                         'supplement_count':sum(r.get('market')==m and r.get('pool_role')=='intraday_supplement' for r in self.candidates),
                         'error':self.daily_core.get(m,{}).get('error')} for m in ['CN','US']},
                     'monitored':len(self.tracked()),'ready':sum(bool(v.get('ready')) for s,v in self.validation.items() if s in self.tracked()),
-                    'last_scan':self.last_scan,'full_market':False,'strategy_universe':'A股全市场','scope_label':'灵犀全市场策略初筛，本地仅复核返回候选',
+                    'last_scan':self.last_scan,'full_market':False,'strategy_universe':'沪深主板、创业板','scope_label':'沪深主板和创业板分页扫描，覆盖进度见自动研究',
                     'strategy_screen':{k:strategy_screen.get(k) for k in ['updated_at','queries','errors']}},
                 'providers':{k:dict(v.status,auth_url=self.lb.auth_url if k=='longbridge' else None) for k,v in self.providers.items()},
                 'scanning':self.scanning,'market_stats':self.market_stats,'market_stats_time':self.market_stats_time,
@@ -765,7 +776,7 @@ class Dashboard:
                 'selection_errors':self.selection_errors,'selection_updated':self.store.get('selection_updated'),
                 'signals':self.store.signals(),'simulation':simulation,'failures':self.sim.state['failures'][-60:],
                 'pending':list(self.sim.state['pending'].values()),'events':self.store.events(),'benchmarks':self.store.benchmarks(),
-                'workspaces':workspaces}
+                'workspaces':workspaces,'auto_research':self.autoresearch.diagnostics()}
 
     def strategy_performance(self,market):
         result={}
@@ -948,7 +959,7 @@ class Dashboard:
         if not re.fullmatch(r'[A-Z0-9.\-]{1,16}\.(US|SH|SZ)',symbol):
             pool={s:r.get('name',s) for s,r in self.security_map.items()}
             pool.update({r['symbol']:r.get('name',r['symbol']) for r in self.candidates})
-            pool.update({r['symbol']:r.get('name',r['symbol']) for r in self.real.list()})
+            pool.update({r['symbol']:r.get('name',r['symbol']) for r in self.research_real_holdings()})
             exact=[s for s,name in pool.items() if str(name).upper()==symbol]
             partial=[s for s,name in pool.items() if symbol and symbol in str(name).upper()]
             matches=exact or partial
@@ -1000,7 +1011,7 @@ class Dashboard:
                 fetch_errors=[key for key,value in fetched.items() if isinstance(value,Exception)]
                 if isinstance(fetched.get('daily'),list):
                     daily=[b for b in fetched['daily'] if local_date(b.start,market)<day]
-                    if daily:self.store.set('selection_daily:'+symbol,{'fetched_date':str(day),'bars':[b.dump() for b in daily]})
+                    if daily:self.store.set('selection_daily:'+symbol,{'fetched_date':str(day),'cutoff':str(daily_cutoff(now(),market)),'bars':[b.dump() for b in daily]})
                 if isinstance(fetched.get('intraday'),list):
                     batch=[b for b in fetched['intraday'] if b.final and b.end<=now() and is_open(b.start,market)]
                     for bar in batch:self.store.bar(bar)
@@ -1088,7 +1099,7 @@ class Dashboard:
                     'atr_pct':_atr_pct(daily),'average_turnover':factors.get('average_turnover'),
                     'reason':'数据通过' if data_ready and factors.get('eligible') and cap else
                              '等待完整日线、五分钟K线和基准同步' if not data_ready else '市值、趋势、流动性或相对强弱尚未全部通过'}
-        stored_holdings=self.real.list();stored_holding=next((p for p in stored_holdings if p['symbol']==symbol and p.get('quantity',0)>0),None)
+        stored_holdings=self.research_real_holdings();stored_holding=next((p for p in stored_holdings if p['symbol']==symbol and p.get('quantity',0)>0),None)
         temporary=list(stored_holdings);holding_input=data.get('holding') or {};holding_origin='saved' if stored_holding else None
         if holding_input.get('quantity') and holding_input.get('cost'):
             temporary=[p for p in temporary if p['symbol']!=symbol]
@@ -1633,7 +1644,7 @@ class Dashboard:
         t=now()
         planned_real={p['id']:p for p in self.real_plans}
         real=[]
-        for position in self.real.list():
+        for position in self.research_real_holdings():
             if not suffix(position['symbol']):continue
             plan=planned_real.get(position['id']) or real_holding_plan(
                 position,self.quotes.get(position['symbol']),t,self.validation.get(position['symbol'],{}))
@@ -1652,7 +1663,7 @@ class Dashboard:
         if urgent:status='MANAGE';headline='先处理持仓风险'
         elif primary:status='BUY';headline=f"当前首选：{primary.get('name',primary['symbol'])}"
         else:status='WAIT';headline='今天暂不买'
-        market_alerts=[a for a in alerts if a.get('symbol') and suffix(a['symbol'])]
+        market_alerts=[a for a in alerts if (a.get('symbol') and suffix(a['symbol'])) or (market=='CN' and a.get('kind')=='research')]
         market_quotes=[self.quotes[s] for s in tracked if s in self.quotes]
         latest=max((q.market_time for q in market_quotes if q.market_time),default=None)
         latest_received=max((q.received_at for q in market_quotes),default=None)
@@ -1660,7 +1671,7 @@ class Dashboard:
         latest_bar=max(last_bars,default=None)
         ready=sum(bool(self.validation.get(s,{}).get('ready')) for s in tracked)
         fresh=sum(fresh_quote(self.quotes.get(s),now()) for s in tracked)
-        uncovered=sum(s not in tracked for s in self.real.symbols() if suffix(s))
+        uncovered=sum(s not in tracked for s in self.research_real_symbols() if suffix(s))
         current_time=now();open_now=is_open(current_time,market);market_phase=phase(current_time,market)
         session_day=local_date(current_time,market)
         evaluated=[]
@@ -1680,7 +1691,7 @@ class Dashboard:
         wait_summary=[{'reason':reason,'count':count} for reason,count in
                       sorted(wait_counts.items(),key=lambda item:(-item[1],item[0]))[:3]]
         market_selection=sum(r.get('market')==market for r in self.selection)
-        scan_running=bool(self.scanning or self.selection_running)
+        scan_running=bool(self.scanning or self.selection_running or (market=='CN' and self.autoresearch.task and not self.autoresearch.task.done()))
         if primary:
             session_conclusion=f'当前{len(buys)}只通过买点与执行检查'
         elif urgent:
@@ -1694,6 +1705,10 @@ class Dashboard:
             session_conclusion=f'已选出{len(premarket)}只盘前观察股，等待本交易日完整五分钟K线'
         else:
             session_conclusion='当前没有可用的盘前观察名单'
+        if market=='CN' and not urgent and not primary and open_now:
+            research=self.autoresearch.status
+            if research.get('state') in ('error','interrupted') or (tracked and not ready):
+                session_conclusion='数据不足：'+research.get('reason','行情或历史仍待恢复')
         if not urgent and not primary:
             if market_phase=='午间休市' and evaluated:headline='上午盘结论：暂不买'
             elif open_now and scan_running:headline='自动复核中，当前暂不买'
@@ -1741,6 +1756,7 @@ class Dashboard:
                             'evaluated_count':len(evaluated),'signals_today':len(today_signals),'buyable_now':len(buys),
                             'failed_fills_today':len(today_failures),'wait_reasons':wait_summary,
                             'scan_progress':dict(self.selection_progress),'last_scan':self.last_scan}},
+            'research':self.autoresearch.diagnostics() if market=='CN' else None,
             'premarket':premarket,'candidates':candidates,
             'holdings':{'real':real,'paper':paper,'actionable':actionable[:6]},
             'alerts':market_alerts,'simulation':dict(simulation[market],shadow=self.sim.shadow_summary(market).get(market,{})),
@@ -1798,15 +1814,25 @@ class Dashboard:
     def allocate_monitoring(self):
         markets=[m for m in ['CN','US'] if monitoring_window(now(),m)]
         if not markets:return
-        held=[s for a in self.sim.state['accounts'].values() for s in a['positions']]
-        pending=[s['symbol'] for s in list(self.sim.state['pending'].values())+list(self.sim.state['shadow']['pending'].values())]
-        picks=[r['symbol'] for r in self.selection if r.get('market') in markets and r['decision']=='重点观察']
-        swing=[r['symbol'] for r in sorted(self.selection,key=lambda r:(-(r.get('rs_percentile') or 0),r.get('atr_contraction') or 999,r['symbol']))
-               if r.get('market') in markets and r.get('decision')!='暂不参与' and r.get('atr_contraction') is not None]
-        fallback=[r['symbol'] for r in self.selection if r.get('market') in markets and r['decision']!='暂不参与']
-        gpt=self.active_gpt_symbols(markets)
-        desired=list(dict.fromkeys(self.real.symbols()+held+self.manual_watch+pending+gpt+picks+swing+fallback+[s for s in self.watch if symbol_market(s) in markets]))[:self.settings['monitor_limit']]
-        if desired and desired!=self.watch:
+        protected=[s for s in self.protected_monitoring() if symbol_market(s) in markets]
+        limit=min(12,self.settings['monitor_limit']) if 'CN' in markets else self.settings['monitor_limit']
+        if 'CN' in markets:
+            rows=[r for r in self.selection if r.get('market')=='CN']
+            minute=now().replace(second=0,microsecond=0)
+            round_id=minute.replace(minute=minute.minute//5*5).isoformat()
+            desired,changes=rotate_monitoring([s for s in self.watch if symbol_market(s)=='CN'],rows,protected,self.autoresearch.votes,round_id,limit)
+            for change in changes:
+                change.update(market='CN',date=str(local_date(now(),'CN')),time=now().isoformat(),run_id=self.autoresearch.status.get('run_id'))
+                self.store.research_save('change',uuid4().hex,change)
+            if changes and is_open(now(),'CN'):
+                from hashlib import sha256
+                signature=sha256(json.dumps([(r['symbol'],r['state']) for r in changes],sort_keys=True).encode()).hexdigest()[:16]
+                self.alerts.emit('research-change:'+str(local_date(now(),'CN'))+':'+signature,'A股重点监测变化',
+                    '；'.join(r['symbol']+' '+r['state'] for r in changes[:6])+'。这是研究范围变化，买点仍须盘中确认。','research')
+        else:
+            picks=[r['symbol'] for r in self.selection if r.get('market') in markets and r['decision']=='重点观察']
+            desired=list(dict.fromkeys(protected+self.active_gpt_symbols(markets)+picks))[:limit]
+        if desired!=self.watch:
             self.watch=desired;self.store.set('watch',desired);self.first_poll=True
 
     async def sync_real_holdings(self,sources=('longbridge','ibkr')):
@@ -1822,7 +1848,7 @@ class Dashboard:
                 self.holding_sync[source]={'state':'connected','message':f'已同步 {len(synced)} 只多头股票持仓',
                                            'updated_at':now().isoformat(),'count':len(synced)}
             except Exception as exc:
-                current=sum(r.get('source')==source for r in self.real.list())
+                current=sum(r.get('source')==source for r in self.research_real_holdings())
                 self.holding_sync[source]={'state':'waiting','message':'本次同步未完成，保留上次结果' if current else str(exc),
                                            'updated_at':now().isoformat(),'count':current}
         self.store.set('holding_sync',self.holding_sync)
@@ -1833,14 +1859,14 @@ class Dashboard:
         await asyncio.sleep(3)
         while self.alive:
             try:
-                await self.sync_real_holdings(['longbridge'])
-                if self.ib.ib and self.ib.ib.isConnected():await self.sync_real_holdings(['ibkr'])
+                if self.settings.get('account_mode',False):await self.sync_real_holdings(['longbridge'])
+                if self.settings.get('account_mode',False) and self.ib.ib and self.ib.ib.isConnected():await self.sync_real_holdings(['ibkr'])
             except asyncio.CancelledError:raise
             except Exception as exc:self.store.event('holdings',{'message':'真实持仓同步未完成','error_type':type(exc).__name__})
             await asyncio.sleep(300)
 
     def premarket(self,market):
-        rows=[dict(r) for r in self.selection if r.get('market')==market and r.get('decision')!='暂不参与']
+        rows=[dict(r) for r in self.selection if r.get('market')==market and r.get('decision')!='暂不参与' and r.get('data_quality')!='missing']
         rows=diversified_rank(rows,10)
         core=self.daily_core.get(market,{})
         result=[]
@@ -1871,13 +1897,14 @@ class Dashboard:
         t=now();state=deepcopy(self.sim.state)
         raws=self.store.signals()
         names={r['symbol']:r.get('name',r['symbol']) for r in self.candidates}
-        real_rows=self.real.list()
+        real_rows=self.research_real_holdings()
         for p in real_rows:
             p['risk_group']=self.validation.get(p['symbol'],{}).get('risk_group',p.get('risk_group','pending'))
             names[p['symbol']]=p.get('name') or names.get(p['symbol'],p['symbol'])
         active=self.registry.active_versions()
-        result=recommend(raws,self.quotes,self.validation,state,t,real_rows,active) if self.monitor_running else []
-        shadow_rows=shadow_recommend(raws,self.quotes,self.validation,state,t,active) if self.monitor_running else []
+        validation={s:{**v,'research_eligible':self.research_entry_allowed(s)} for s,v in self.validation.items()}
+        result=recommend(raws,self.quotes,validation,state,t,real_rows,active) if self.monitor_running else []
+        shadow_rows=shadow_recommend(raws,self.quotes,validation,state,t,active) if self.monitor_running else []
         for row in shadow_rows:
             if row['state']!='buy' or row['signal_id'] in self.sim.state['shadow']['pending']:continue
             raw=next(x for x in raws if x['id']==row['signal_id']);signal=Signal.load(raw)
@@ -1948,7 +1975,7 @@ class Dashboard:
                 tick=current
                 if self.monitor_running:
                     if current>=next_poll and self.lb.ctx and (not self.live_task or self.live_task.done()):
-                        self.live_task=asyncio.create_task(self.refresh_live());self.tasks.append(self.live_task);next_poll=current+15
+                        self.live_task=asyncio.create_task(self.refresh_live());self.tasks.append(self.live_task);next_poll=current+5
                     for s in self.tracked():
                         if isinstance(self.strategies,ResearchEngine) and self.validation.get(s,{}).get('ready'):
                             for signal in self.strategies.evaluate(s,self.validation[s].get('risk_group','pending')):self.register_signal(signal)
@@ -1969,7 +1996,7 @@ class Dashboard:
             for q in await self.lb.quotes(active):self.accept_quote(q)
             # Books are queried only for active holdings or currently valid technical signals.
             needed=set(s for a in self.sim.state['accounts'].values() for s in a['positions'])
-            needed.update(self.real.symbols())
+            needed.update(self.research_real_symbols())
             active_versions=self.registry.active_versions()
             needed.update(r['symbol'] for r in self.store.signals()
                           if r.get('version')==active_versions.get((symbol_market(r['symbol']),r.get('strategy')))
@@ -2012,11 +2039,11 @@ class Dashboard:
 
     async def prepare_research(self):
         for market,symbol in BENCHMARKS.items():
-            day=local_date(now(),market);key=f'benchmark_daily:{market}:{day}'
+            day=local_date(now(),market);key=f'benchmark_daily:{market}:{daily_cutoff(now(),market)}'
             cached=self.store.get(key)
             if not cached:
                 try:
-                    bars=[b for b in await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT) if local_date(b.start,market)<day]
+                    bars=complete_daily(await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT,force_cli=True),now(),market)
                     if len(bars)<61:continue
                     cached=[b.dump() for b in bars];self.store.set(key,cached)
                 except Exception:
@@ -2024,17 +2051,17 @@ class Dashboard:
             self.benchmark_daily[market]=[Bar.load(b) for b in cached]
         for symbol in self.tracked():
             market=symbol_market(symbol);day=local_date(now(),market)
-            if self.research_ready.get(symbol)==str(day):continue
+            if self.research_ready.get(symbol)==str(daily_cutoff(now(),market)) and self.research_progress.get(symbol,{}).get('all_ready'):continue
             if market not in self.benchmark_daily:continue
             self.research_progress[symbol]={'state':'loading','days':0,'required':14}
             try:
                 refs=await self.lb.reference_info([symbol]);meta=self.candidate(symbol)
                 if symbol in refs:meta.update(name=refs[symbol]['name'])
                 cached=self.store.get('selection_daily:'+symbol,{})
-                daily=[Bar.load(b) for b in cached.get('bars',[])] if cached.get('fetched_date')==str(day) and len(cached.get('bars',[]))>=DAILY_CACHE_MIN else []
+                daily=[Bar.load(b) for b in cached.get('bars',[])] if cached.get('cutoff')==str(daily_cutoff(now(),market)) and len(cached.get('bars',[]))>=65 else []
                 if not daily:
-                    daily=[b for b in await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT) if local_date(b.start,market)<day]
-                    self.store.set('selection_daily:'+symbol,{'fetched_date':str(day),'bars':[b.dump() for b in daily]})
+                    daily=complete_daily(await self.lb.bars(symbol,'day',DAILY_FETCH_COUNT,force_cli=True),now(),market)
+                    self.store.set('selection_daily:'+symbol,{'fetched_date':str(day),'cutoff':str(daily_cutoff(now(),market)),'bars':[b.dump() for b in daily]})
                 if symbol in refs and refs[symbol].get('total_shares') and daily:
                     meta['market_cap']=refs[symbol]['total_shares']*daily[-1].close
                     self.validation.setdefault(symbol,{}).pop('daily_checked',None)
@@ -2064,17 +2091,24 @@ class Dashboard:
                 setup=next((r for r in self.selection if r['symbol']==symbol),{})
                 rank={'percentile':setup.get('rs_percentile'),'coverage':setup.get('rs_rank_coverage',0)}
                 self.strategies.prepare(symbol,daily,history,self.benchmark_daily[market],rank)
-                self.research_ready[symbol]=str(day)
+                self.research_ready[symbol]=str(daily_cutoff(now(),market))
                 f=self.strategies.context[symbol]['daily']
-                daily_need=max(self.analysis_daily_required(k,self.registry.config(k,market)) for k,d in DEFINITIONS.items() if market in d['markets'])
-                self.research_progress[symbol]={'state':'ready' if days==14 and len(daily)>=daily_need and f.get('eligible') else 'filtered' if not f.get('eligible') else 'waiting','days':days,'required':14,
-                    'daily_bars':len(daily),'daily_required':daily_need,
-                    'reason':f['reason'] if days==14 and len(daily)>=daily_need else f'日线预热 {len(daily)}/{daily_need}' if len(daily)<daily_need else '最近历史不足14日；已缓存，后续交易日自动补齐'}
+                per_strategy={}
+                for k,definition in DEFINITIONS.items():
+                    if market not in definition['markets'] or not self.registry.enabled(k,market):continue
+                    need=self.analysis_daily_required(k,self.registry.config(k,market))
+                    baseline=definition['data_requirements']['intraday_baseline_sessions']
+                    per_strategy[k]={'ready':len(daily)>=need and days>=baseline,'daily_required':need,'baseline_required':baseline}
+                ready=any(v['ready'] for v in per_strategy.values())
+                self.research_progress[symbol]={'state':'ready' if ready else 'waiting','days':days,'required':14,
+                    'daily_bars':len(daily),'strategies':per_strategy,'all_ready':bool(per_strategy) and all(v['ready'] for v in per_strategy.values()),
+                    'reason':f['reason'] if ready else '按策略分别补齐日线和同时间量能基线'}
                 self.first_poll=True
             except Exception as exc:
                 self.research_progress[symbol]={'state':'waiting','reason':'完整历史或成交量口径待核验','error_type':type(exc).__name__}
         # Re-evaluate cached candidate daily data once benchmark data becomes available.
         for r in self.selection:
+            if r.get('market')=='CN':continue
             m=symbol_market(r['symbol']);cached=self.store.get('selection_daily:'+r['symbol'],{})
             if cached.get('bars') and m in self.benchmark_daily:
                 f=daily_factors(r['symbol'],[Bar.load(b) for b in cached['bars']],self.benchmark_daily[m])

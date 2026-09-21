@@ -98,24 +98,20 @@ def test_failed_daily_rebuild_keeps_snapshot_and_does_not_mark_complete(tmp_path
     asyncio.run(d.run_premarket_scan(['CN']))
     assert 'CN' not in d.store.get('premarket_scan_marker',{})
 
-def test_daily_core_and_intraday_supplement_are_separate_and_industry_is_kept(tmp_path,monkeypatch):
-    d=Dashboard(tmp_path);fixed=stamp('2026-09-10T02:00:00Z')
-    monkeypatch.setattr('app.service.now',lambda:fixed)
-    d.security_map={s:{'name':s,'证券类型':'1'} for s in ['600001.SH','300001.SZ']}
-    async def strategy(force=False):
-        return [{'symbol':'600001.SH','name':'样本银行','source':'lingxi','candidate_strategies':['breakout'],
-                 'candidate_origin':'strategy'}],{'queries':[{'group':'breakout'}],'errors':[]}
+def test_legacy_scan_keeps_us_separate_and_delegates_cn_discovery(tmp_path,monkeypatch):
+    d=Dashboard(tmp_path);requested=[]
+    d.autoresearch.request=lambda force=False:requested.append(force)
+    d.daily_core={'CN':{'rows':[{'symbol':'600001.SH','name':'分页样本','industry':'银行','market':'CN',
+                                'candidate_origin':'universe','pool_role':'daily_core'}]}}
     async def cli_scan(market):
-        item={'symbol':'600001.SH','name':'样本银行','industry':'银行','prevclose':10,'prevchg':1,'marketcap':1e10} if market=='CN' else {'symbol':'AAPL.US','name':'Apple','industry':'消费电子','prevclose':200,'prevchg':1,'marketcap':3e12}
-        return {'items':[item]}
-    async def rank(order):
-        return ([{'symbol':'300001.SZ','name':'盘中样本','source':'lingxi'}],{}) if order==10 else ([],{})
-    d.strategy_candidate_scan=strategy;d.lb.cli_scan=cli_scan;d.lingxi.rank=rank;d.schedule_selection=lambda:None
+        assert market=='US'
+        return {'items':[{'symbol':'AAPL.US','name':'Apple','industry':'消费电子','prevclose':200}]}
+    async def forbidden(*args,**kwargs):raise AssertionError('CN must not fall back to ranking lists')
+    d.lb.cli_scan=cli_scan;d.lingxi.rank=forbidden;d.schedule_selection=lambda:None
     rebuilt=asyncio.run(d.scan(force_strategy=True,rebuild_markets=['CN','US']))
     rows={r['symbol']:r for r in d.candidates}
-    assert rebuilt=={'CN','US'} and rows['600001.SH']['industry']=='银行'
-    assert rows['600001.SH']['pool_role']=='daily_core'
-    assert rows['300001.SZ']['pool_role']=='intraday_supplement'
+    assert rebuilt=={'US'} and requested==[True]
+    assert rows['600001.SH']['industry']=='银行' and rows['600001.SH']['candidate_origin']=='universe'
     assert d.daily_core['US']['rows'][0]['industry']=='消费电子'
 
 def test_daily_core_is_capped_at_80_and_keeps_strategy_candidates_first(tmp_path):
@@ -135,34 +131,28 @@ def test_saved_oversized_core_is_trimmed_when_dashboard_starts(tmp_path):
     assert len(dashboard.daily_core['US']['rows'])==80
     assert len(dashboard.store.get('daily_candidate_core')['US']['rows'])==80
 
-def test_failed_core_refresh_preserves_last_valid_rows_as_stale(tmp_path,monkeypatch):
-    d=Dashboard(tmp_path);fixed=stamp('2026-09-10T02:00:00Z')
-    monkeypatch.setattr('app.service.now',lambda:fixed)
-    d.security_map={'600001.SH':{'name':'旧候选','证券类型':'1'}}
-    d.daily_core={'CN':{'trade_date':'2026-09-09','updated_at':'2026-09-09T01:00:00Z','stale':False,
-                        'rows':[{'symbol':'600001.SH','name':'旧候选','source':'lingxi','candidate_strategies':['breakout'],'pool_role':'daily_core'}]}}
-    async def unavailable(*args,**kwargs):raise RuntimeError('private detail')
-    async def rank(order):return [],{}
-    d.strategy_candidate_scan=unavailable;d.lb.cli_scan=unavailable;d.lingxi.rank=rank;d.schedule_selection=lambda:None
-    rebuilt=asyncio.run(d.scan(rebuild_markets=['CN']))
-    assert rebuilt==set() and d.daily_core['CN']['stale']
-    assert [r['symbol'] for r in d.candidates if r['market']=='CN']==['600001.SH']
-
-def test_manual_full_market_scan_discards_previous_candidate_pool(tmp_path):
+def test_failed_cn_discovery_preserves_last_valid_core_as_stale(tmp_path):
     d=Dashboard(tmp_path)
-    d.security_map={'600001.SH':{'name':'新候选','证券类型':'1'}}
-    d.selection=[{'symbol':'000001.SZ','market':'CN','decision':'重点观察','score':90,'distance_to_high_pct':0}]
+    d.daily_core={'CN':{'trade_date':'2026-09-09','rows':[{'symbol':'600001.SH','name':'旧候选'}],'stale':False}}
+    async def unavailable(*args,**kwargs):raise RuntimeError('private detail')
+    d.lb.universe_page=unavailable
+    asyncio.run(d.autoresearch.scan())
+    assert d.daily_core['CN']['stale']
+    assert d.daily_core['CN']['rows'][0]['symbol']=='600001.SH'
+    assert d.autoresearch.status['state']=='error'
+
+
+def test_manual_full_market_scan_requests_new_universe_without_destroying_history(tmp_path):
+    d=Dashboard(tmp_path);requests=[]
+    d.autoresearch.request=lambda force=False:requests.append(force)
     d.store.set('selection_pool',{'date':'2026-09-09','rows':[{'symbol':'000001.SZ'}]})
-    async def strategy(force=False):
-        assert force
-        return [{'symbol':'600001.SH','name':'新候选','source':'lingxi','candidate_strategies':['breakout']}],{}
-    async def rank(order):return [],{}
     async def us_scan(market):return {'items':[]}
-    d.strategy_candidate_scan=strategy;d.lingxi.rank=rank;d.lb.cli_scan=us_scan;d.schedule_selection=lambda:None
+    d.lb.cli_scan=us_scan;d.schedule_selection=lambda:None
     asyncio.run(d.scan(force_strategy=True))
-    assert d.store.get('selection_pool')=={}
-    assert not d.selection
-    assert [row['symbol'] for row in d.candidates]==['600001.SH']
+    assert requests==[True]
+    # Old cache isn't evidence of today's completion and isn't silently discarded before a new scan succeeds.
+    assert not d.autoresearch.status.get('universe_complete',False)
+    assert 'CN' not in d.store.get('premarket_scan_marker',{})
 
 def test_local_api_rejects_cross_origin_and_private_files(tmp_path,monkeypatch):
     import app.main as main

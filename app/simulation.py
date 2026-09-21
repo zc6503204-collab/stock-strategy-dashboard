@@ -42,6 +42,7 @@ def _metrics(trades,failures=()):
     return {'count':count,'net_pnl':sum(values),'win_rate':rate,'win_rate_interval':interval,
             'profit_factor':sum(wins)/sum(losses) if losses else None,
             'payoff':(sum(wins)/len(wins))/(sum(losses)/len(losses)) if wins and losses else None,
+            'average_win':sum(wins)/len(wins) if wins else None,'average_loss':sum(losses)/len(losses) if losses else None,
             'expectancy':sum(values)/count if count else None,'max_drawdown':drawdown*100,'loss_streak':longest,
             'double_cost_pnl':sum(t.get('double_cost_pnl',t.get('net_pnl',0)) for t in trades),
             'avg_holding':sum(t.get('holding_sessions',0) for t in trades)/count if count else None,

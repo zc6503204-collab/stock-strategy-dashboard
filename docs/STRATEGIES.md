@@ -82,3 +82,11 @@ A股与美股参数分别保存。参数保存或回滚会生成不可修改的�
 - [A Profitable Day Trading Strategy For The U.S. Equity Market](https://concretumgroup.com/wp-content/uploads/2026/02/A-Profitable-Day-Trading-Strategy-For-The-U.S.-Equity-Market.pdf)
 - [FINRA：Stop Orders—Factors to Consider During Volatile Markets](https://www.finra.org/investors/insights/stop-orders-factors-consider-during-volatile-markets)
 - [开源项目调研与本地取舍](GITHUB_RESEARCH.md)
+
+## 自动发现与研究证据
+
+A股发现使用长桥分页证券范围，榜单不是资格条件。每天重新核验日线资格；盘中按完整支持范围复筛报价，从最多80只研究候选中动态分配12个重点监测名额。两轮领先5分仅用于稳定监测分配，不参与收益预测。
+
+日线取最近完整交易日，收盘前不使用当日未完成日线。策略按各自所需历史独立预热。市场、板块、个股、Setup、买点、风险链路中的缺口会显示在首页；当前实验规则的准备度不等于《A股短线AI交易决策系统》的完整评级。
+
+S04强势缩量回踩、S05急跌后右侧修复仅为规则卡，需补齐市场与板块历史、公告核验和样本外结果后才可讨论启用。历史基线策略保持原参数和账本，前向影子与组合模拟继续分开统计。

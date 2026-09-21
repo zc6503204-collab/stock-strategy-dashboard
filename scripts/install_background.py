@@ -17,6 +17,8 @@ agent=Path.home()/'Library/LaunchAgents/local.shortlist.dashboard.plist';agent.p
 config={'Label':'local.shortlist.dashboard','ProgramArguments':[str(ROOT/'.venv/bin/python'),'-m','uvicorn','app.main:app','--host','127.0.0.1','--port','8765','--no-access-log','--timeout-graceful-shutdown','3'],
         'WorkingDirectory':str(ROOT),'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':15,
         'EnvironmentVariables':{'PATH':path,'PYTHONUNBUFFERED':'1'},'StandardOutPath':str(ROOT/'.local/server.log'),
-        'StandardErrorPath':str(ROOT/'.local/server.log'),'ProcessType':'Background'}
+        # This serves an interactive local UI and time-sensitive market callbacks.
+        # Background QoS can severely throttle startup and feed handling on macOS.
+        'StandardErrorPath':str(ROOT/'.local/server.log'),'ProcessType':'Interactive'}
 agent.write_bytes(plistlib.dumps(config));agent.chmod(0o600)
 print('本机通知助手与登录启动配置已生成；启动服务需使用 launchctl bootstrap。')

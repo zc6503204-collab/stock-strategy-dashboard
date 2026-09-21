@@ -42,7 +42,7 @@ def test_workspaces_are_isolated_and_limit_decision_slots(tmp_path, monkeypatch)
     ]
     snapshot = dashboard.snapshot()
     assert snapshot['coverage']['full_market'] is False
-    assert snapshot['coverage']['scope_label'] == '灵犀全市场策略初筛，本地仅复核返回候选'
+    assert snapshot['coverage']['scope_label'] == '沪深主板和创业板分页扫描，覆盖进度见自动研究'
     assert snapshot['coverage']['candidates_by_market'] == {'CN': 1, 'US': 1}
     assert snapshot['coverage']['strategy_candidates_by_market'] == {'CN': 0, 'US': 0}
     assert snapshot['coverage']['supplement_candidates_by_market'] == {'CN': 1, 'US': 1}
@@ -64,6 +64,7 @@ def test_workspace_holding_action_overrides_buy_and_fallback_is_renderable(tmp_p
     fixed = now()
     monkeypatch.setattr('app.service.now', lambda: fixed)
     dashboard = Dashboard(tmp_path)
+    dashboard.settings['account_mode']=True
     dashboard.real.upsert_manual({
         'symbol': 'AAPL.US', 'name': 'Apple', 'quantity': 2, 'cost': 100,
         'entry_date': '2026-09-01', 'stop': None, 'target': None,

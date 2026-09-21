@@ -76,5 +76,5 @@ def monitoring_window(t,market):
     try:
         day=local_date(t,market)
         if not calendar(market).is_session(str(day)):return False
-        return open_time(day,market)-timedelta(minutes=15)<=t<=close_time(day,market)+timedelta(minutes=10)
+        return open_time(day,market)-timedelta(minutes=20 if market=='CN' else 15)<=t<=close_time(day,market)+timedelta(minutes=10)
     except (ValueError,KeyError):return False

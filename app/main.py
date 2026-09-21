@@ -126,6 +126,7 @@ class Settings(BaseModel):
     monitor_limit:int=Field(default=12,ge=1,le=40)
     simulation_enabled:bool=True
     ib_port:int=Field(default=7497,ge=1024,le=65535)
+    account_mode:bool=False
 
 class ManualHolding(BaseModel):
     id:str|None=Field(default=None,max_length=80)
@@ -293,6 +294,8 @@ async def settings(body:Settings):
 
 @app.post('/api/real-holdings/manual')
 async def real_holding_manual(body:ManualHolding):
+    dashboard.settings['account_mode']=True
+    dashboard.store.set('settings',dashboard.settings)
     try:row=dashboard.real.upsert_manual(body.model_dump())
     except ValueError as e:raise HTTPException(400,str(e))
     dashboard.candidate(row['symbol'])['name']=row['name'];dashboard.first_poll=True
@@ -313,6 +316,8 @@ async def real_holding_remove(body:HoldingId):
 @app.post('/api/real-holdings/sync')
 async def real_holding_sync(body:HoldingSync):
     if body.source not in ['all','longbridge','ibkr']:raise HTTPException(400,'未知持仓来源')
+    dashboard.settings['account_mode']=True
+    dashboard.store.set('settings',dashboard.settings)
     sources=['longbridge','ibkr'] if body.source=='all' else [body.source]
     await dashboard.sync_real_holdings(sources)
     return {'ok':True,'status':dashboard.holding_sync}
@@ -364,7 +369,7 @@ async def last_screen():return dashboard.store.get('last_screen')
 
 @app.post('/api/selection')
 async def selection():
-    dashboard.schedule_selection();return {'ok':True}
+    dashboard.autoresearch.request();dashboard.schedule_selection();return {'ok':True}
 
 class SelectionPriority(BaseModel):market:str='CN'
 
@@ -373,3 +378,29 @@ async def prioritize(body:SelectionPriority):
     try:await dashboard.prioritize_selection(body.market)
     except ValueError as e:raise HTTPException(400,str(e))
     return {'ok':True}
+
+
+def research_market(market):
+    if market not in ('CN','US'):raise HTTPException(400,'未知市场')
+    return market
+
+
+@app.get('/api/research/days')
+async def research_days(market:str='CN',date:str|None=None,limit:int=30):
+    market=research_market(market)
+    return {'runs':dashboard.store.research_list('run',market,date,limit=limit),
+            'reports':dashboard.store.research_list('report',market,date,limit=limit)}
+
+
+@app.get('/api/research/candidates/{symbol}')
+async def research_candidate(symbol:str,limit:int=100):
+    import re
+    if not re.fullmatch(r'[A-Z0-9.\-]{1,16}\.(SH|SZ|US)',symbol):raise HTTPException(400,'证券代码格式错误')
+    market='US' if symbol.endswith('.US') else 'CN'
+    return {'symbol':symbol,'checks':dashboard.store.research_list('candidate',market,symbol=symbol,limit=limit),
+            'changes':dashboard.store.research_list('change',market,symbol=symbol,limit=limit)}
+
+
+@app.get('/api/research/comparison')
+async def research_comparison(market:str='CN'):
+    return dashboard.autoresearch.comparison(research_market(market))
